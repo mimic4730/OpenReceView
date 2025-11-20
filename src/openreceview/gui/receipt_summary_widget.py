@@ -26,45 +26,13 @@ from PySide6.QtWidgets import (
 from typing import Optional
 from openreceview.models.uke_receipt import UkeReceipt
 
-# 別表28 負担者種別コード
-FUTANSHA_TYPE_MAP: dict[str, str] = {
-    "1": "1: 医療保険／国保／後期高齢",
-    "2": "2: 第1公費負担医療",
-    "3": "3: 第2公費負担医療",
-    "4": "4: 第3公費負担医療",
-    "5": "5: 第4公費負担医療",
-}
-# 別表29 確認区分コード
-KAKUNIN_KUBUN_MAP: dict[str, str] = {
-    "01": "01: 保険医療機関・薬局窓口等",
-    "02": "02: 審査支払機関に請求後変更なし",
-    "03": "03: 確認不能",
-    "04": "04: 振替",
-    "05": "05: 分割",
-    "06": "06: レセプト記載の保険者等に請求",
-    "07": "07: 資格喪失（証回収後）",
-    "08": "08: 資格喪失（死亡）",
-    "09": "09: 枝番特定",
-    "11": "11: 保険者等に請求後振替",
-    "12": "12: 分割",
-    "13": "13: 変更不能",
-    "14": "14: 枝番特定",
-}
-# 別表30 受診等区分コード
-JUSHIN_KUBUN_MAP: dict[str, str] = {
-    "": "",
-    "1": "1",   # 診療実日数に計上する受診及び入院
-    "2": "2",   # 診療実日数に計上しない受診(初診又は再診に付随する一連の行為等)
-    "9": "9",   # 請求データの各レコードに記録された算定日情報と不一致
-}
-# 別表31 窓口負担額区分コード
-MADOGUCHI_KBN_MAP: dict[str, str] = {
-    "00": "00: 一部負担金（高額療養費の現物給付なし）",
-    "01": "01: 一部負担金（高額療養費の現物給付あり）",
-    "02": "02: 食事療養費・生活療養費（標準負担額）",
-    "03": "03: 食事療養費・生活療養費（標準負担額以外）",
-    "04": "04: 外来一部負担金（高額療養費の現物給付あり）",
-}
+from openreceview.code_tables import (
+    futansha_type_map,
+    kakunin_kubun_map,
+    jushin_kubun_map,
+    madoguchi_kbn_map,
+)
+
 
 class ReceiptSummaryWidget(QWidget):
     """
@@ -224,9 +192,13 @@ class ReceiptSummaryWidget(QWidget):
         patient_layout.addWidget(splitter)
         self.tab_widget.addTab(patient_page, "患者情報")
 
-        # --- 資格確認等タブ -------------------------------------------------
+        # 資格確認等タブ 
         self.qual_widget = QualificationWidget(self)
         self.tab_widget.addTab(self.qual_widget, "資格確認等")
+
+        # 算定日タブ: JD レコードから算定日を表示
+        self.santeibi_widget = SanteibiWidget(self)
+        self.tab_widget.addTab(self.santeibi_widget, "算定日")        
 
         # TODO: 「算定日」「レセプトプレビュー」「レセ電コード[個別]」用タブは
         # 後で空の QWidget を addTab しておけば OK
@@ -241,7 +213,6 @@ class ReceiptSummaryWidget(QWidget):
             lay.addStretch(1)
             self.tab_widget.addTab(page, title)
 
-        add_simple_tab("算定日", "【算定日】タブ（今後実装予定）")
         add_simple_tab("レセプトプレビュー", "【レセプトプレビュー】タブ（今後実装予定）")
         add_simple_tab("レセ電コード[個別]", "【レセ電コード[個別]】タブ（今後実装予定）")
 
@@ -291,9 +262,13 @@ class ReceiptSummaryWidget(QWidget):
         self.lbl_days.setText(days)
         self.lbl_total_points.setText(total_points)
 
-        # --- 資格確認等タブ: SN レコードをセット -----------------------
+        # 資格確認等タブ: SN レコードをセット
         if hasattr(self, "qual_widget"):
             self.qual_widget.set_from_receipt(receipt)
+        
+        # 算定日タブ: JD レコードをセット
+        if hasattr(self, "santeibi_widget"):
+            self.santeibi_widget.set_from_receipt(receipt)        
 
         # 下側テキスト: レコード一覧
         lines: list[str] = []
@@ -343,7 +318,7 @@ class ReceiptSummaryWidget(QWidget):
             code          = get(1).strip()
             start_raw     = get(2).strip()
             tenki_raw     = get(3).strip()
-            modifier_raw  = get(4).strip()   # ★ 修飾語コード（連結）
+            modifier_raw  = get(4).strip()   # 修飾語コード（連結）
             name_in_sy    = get(5).strip()
             main_flag     = get(6).strip()
 
@@ -504,6 +479,8 @@ class ReceiptSummaryWidget(QWidget):
 
         if hasattr(self, "qual_widget"):
             self.qual_widget.clear()
+        if hasattr(self, "santeibi_widget"):
+            self.santeibi_widget.clear()            
 
         self.raw_view.clear()
         self.disease_table.setRowCount(0)
@@ -586,19 +563,27 @@ class QualificationWidget(QWidget):
     def _build_ui(self) -> None:
         # ルートは縦並び
         root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(6)
+        root.setContentsMargins(4, 2, 4, 4)
+        root.setSpacing(3)
 
         # ── 上側: SN / MF 用の2列グリッド ─────────────────
         layout = QGridLayout()
         layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(4)
+        layout.setVerticalSpacing(1)
         root.addLayout(layout)
+
+        # ラベル共通設定ヘルパ
+        def make_label(text: str) -> QLabel:
+            lbl = QLabel(text, self)
+            # 行間を詰めるため、内部マージンをゼロに
+            lbl.setMargin(0)
+            lbl.setContentsMargins(0, 0, 0, 0)
+            return lbl
 
         def add_pair(row: int, pair_index: int, title: str) -> QLabel:
             col = pair_index * 2
-            lbl_title = QLabel(title, self)
-            lbl_value = QLabel("-", self)
+            lbl_title = make_label(title)
+            lbl_value = make_label("-")
 
             layout.addWidget(lbl_title, row, col)
             layout.addWidget(lbl_value, row, col + 1)
@@ -628,9 +613,9 @@ class QualificationWidget(QWidget):
         # ── 下側: 受診日等レコード(JD) ─────────────────────
         jd_group = QGroupBox("受診日等レコード (JD)", self)
         jd_layout = QGridLayout(jd_group)
-        jd_layout.setContentsMargins(4, 4, 4, 4)
+        jd_layout.setContentsMargins(4, 2, 4, 4)
         jd_layout.setHorizontalSpacing(4)
-        jd_layout.setVerticalSpacing(2)
+        jd_layout.setVerticalSpacing(1)
 
         # 1行目: 日付ヘッダ 1〜31
         lbl_day_header = QLabel("日付", jd_group)
@@ -660,6 +645,7 @@ class QualificationWidget(QWidget):
             jd_layout.setColumnStretch(day, 1)
 
         root.addWidget(jd_group)
+        root.addStretch(1)
 
     # ─────────────────────────────
     # 表示更新系
@@ -710,10 +696,10 @@ class QualificationWidget(QWidget):
             kakunin  = get_sn(2).strip()
 
             self.lbl_futansha_type.setText(
-                FUTANSHA_TYPE_MAP.get(futansha, futansha)
+                futansha_type_map().get(futansha, futansha)
             )
             self.lbl_kakunin_kbn.setText(
-                KAKUNIN_KUBUN_MAP.get(kakunin, kakunin)
+                kakunin_kubun_map().get(kakunin, kakunin)
             )
             self.lbl_insurer_all.setText(get_sn(3))
             self.lbl_hihoken_kigo.setText(get_sn(4))
@@ -765,8 +751,152 @@ class QualificationWidget(QWidget):
                 if not raw:
                     disp = ""
                 else:
-                    disp = JUSHIN_KUBUN_MAP.get(raw, raw)
+                    disp = jushin_kubun_map().get(raw, raw)
                 self.jd_value_labels[day - 1].setText(disp)
         else:
             if hasattr(self, "lbl_jd_futansha"):
                 self.lbl_jd_futansha.setText("区分")
+
+class SanteibiWidget(QWidget):
+    """
+    算定日タブ（ヘッダ + SIレコード一覧）
+    """
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        # ── 上側: 患者情報ヘッダ ─────────────────
+        header_group = QGroupBox("算定日ヘッダ情報", self)
+        header_layout = QGridLayout(header_group)
+        header_layout.setHorizontalSpacing(12)
+        header_layout.setVerticalSpacing(2)
+
+        def add_header_item(row: int, col: int, title: str) -> QLabel:
+            base_col = col * 2
+            lbl_title = QLabel(title, header_group)
+            lbl_value = QLabel("-", header_group)
+            header_layout.addWidget(lbl_title, row, base_col)
+            header_layout.addWidget(lbl_value, row, base_col + 1)
+            return lbl_value
+
+        # 1行目
+        self.lbl_san_patient_id   = add_header_item(0, 0, "患者番号")
+        self.lbl_san_receipt_no   = add_header_item(0, 1, "レセプト番号")
+        self.lbl_san_sex          = add_header_item(0, 2, "性別")
+        # 2行目
+        self.lbl_san_type         = add_header_item(1, 0, "種別")
+        self.lbl_san_year_month   = add_header_item(1, 1, "診療年月")
+        # 3行目
+        self.lbl_san_name         = add_header_item(2, 0, "氏名")
+        self.lbl_san_birthday     = add_header_item(2, 1, "生年月日")
+
+        root.addWidget(header_group)
+
+        # ── 下側: SIレコード一覧 ─────────────────
+        self.table = QTableWidget(self)
+        base_cols = ["識別", "負", "診療行為", "数量", "点数", "回数"]
+        day_cols  = [str(d) for d in range(1, 32)]
+        headers   = base_cols + day_cols
+
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+
+        header = self.table.horizontalHeader()
+        # 左側6列は内容に合わせて
+        for col in range(6):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        # 日付列は均等に
+        for col in range(6, len(headers)):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+
+        root.addWidget(self.table)
+
+    # ── クリア ─────────────────
+    def clear(self) -> None:
+        for lbl in [
+            self.lbl_san_patient_id,
+            self.lbl_san_receipt_no,
+            self.lbl_san_sex,
+            self.lbl_san_type,
+            self.lbl_san_year_month,
+            self.lbl_san_name,
+            self.lbl_san_birthday,
+        ]:
+            lbl.setText("-")
+
+        self.table.setRowCount(0)
+
+    # ── レセプトからセット ─────────────────
+    def set_from_receipt(self, receipt: Optional[UkeReceipt]) -> None:
+        self.clear()
+        if receipt is None or receipt.header is None:
+            return
+
+        h = receipt.header
+
+        # ヘッダ情報
+        self.lbl_san_patient_id.setText(h.patient_id or "-")
+        self.lbl_san_sex.setText(h.sex or "-")
+        self.lbl_san_year_month.setText(h.year_month or "-")
+        self.lbl_san_name.setText(h.name or "-")
+        self.lbl_san_birthday.setText(h.birthday or "-")
+
+        # レセプト番号・種別はモデル側の属性名に合わせて適宜変更
+        receipt_no = getattr(h, "receipt_number", None) or getattr(h, "receipt_no", None)
+        self.lbl_san_receipt_no.setText(receipt_no or "-")
+
+        rec_type = getattr(h, "receipt_type", None)
+        self.lbl_san_type.setText(rec_type or "-")
+
+        # ── SIレコード一覧 ──
+        row_idx = 0
+        for rec in receipt.records:
+            if rec.record_type != "SI":
+                continue
+
+            f = rec.fields
+
+            def get(i: int) -> str:
+                return f[i] if len(f) > i and f[i] else ""
+
+            # ★ SIレコード構造（仮置き）
+            # 1: 診療識別
+            # 2: 負担区分
+            # 3: 診療行為コード
+            # 4: 数量データ
+            # 5: 点数
+            # 6: 回数
+            # 7〜37: 算定日情報(1〜31日)
+            shikibetsu = get(1).strip()
+            futan      = get(2).strip()
+            shinryo    = get(3).strip()
+            suuryo     = get(4).strip()
+            tensu      = get(5).strip()
+            kaisuu     = get(6).strip()
+
+            self.table.insertRow(row_idx)
+
+            base_values = [shikibetsu, futan, shinryo, suuryo, tensu, kaisuu]
+            for col, val in enumerate(base_values):
+                self.table.setItem(row_idx, col, QTableWidgetItem(val))
+
+            # 日毎の算定日フラグ
+            for day in range(1, 32):
+                idx = 6 + day  # 1日目→fields[7] と想定
+                val = ""
+                if len(f) > idx and f[idx]:
+                    val = f[idx].strip()
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, 6 + day - 1, item)
+
+            row_idx += 1
