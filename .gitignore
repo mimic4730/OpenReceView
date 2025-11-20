@@ -1,4 +1,15 @@
-# Python cache
+# Python venv
+.venv/
+venv/
+env/
+
+# Python キャッシュ
 __pycache__/
 *.py[cod]
-*.pyo
+
+# エディタ系
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

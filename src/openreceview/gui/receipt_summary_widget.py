@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QLineEdit,
 )
+from PySide6.QtGui import QFont
 from typing import Optional
 from openreceview.models.uke_receipt import UkeReceipt
 
@@ -32,7 +33,6 @@ from openreceview.code_tables import (
     jushin_kubun_map,
     madoguchi_kbn_map,
 )
-
 
 class ReceiptSummaryWidget(QWidget):
     """
@@ -50,6 +50,8 @@ class ReceiptSummaryWidget(QWidget):
         get_disease_kana: Optional[Callable[[str], str]] = None,
         get_modifier_name: Optional[Callable[[str], str]] = None,
         get_modifier_kana: Optional[Callable[[str], str]] = None,
+        get_shinryo_name: Optional[Callable[[str], str]] = None,
+        get_comment_text: Optional[Callable[[str], str]] = None,
     ) -> None:
         super().__init__(parent)
 
@@ -57,6 +59,8 @@ class ReceiptSummaryWidget(QWidget):
         self._get_disease_kana = get_disease_kana
         self._get_modifier_name = get_modifier_name
         self._get_modifier_kana = get_modifier_kana
+        self._get_shinryo_name = get_shinryo_name
+        self._get_comment_text = get_comment_text
 
         # カレントレセプト
         self._current_receipt: Optional[UkeReceipt] = None
@@ -77,9 +81,6 @@ class ReceiptSummaryWidget(QWidget):
         root.setSpacing(4)
 
         # ── 子タブ全体（患者情報 / 資格確認等 / …） ─────────────────
-        # ★ header_tabs は不要なので削除
-        # self.header_tabs = QTabWidget(self)
-
         self.tab_widget = QTabWidget(self)
         root.addWidget(self.tab_widget)
 
@@ -196,9 +197,13 @@ class ReceiptSummaryWidget(QWidget):
         self.qual_widget = QualificationWidget(self)
         self.tab_widget.addTab(self.qual_widget, "資格確認等")
 
-        # 算定日タブ: JD レコードから算定日を表示
-        self.santeibi_widget = SanteibiWidget(self)
-        self.tab_widget.addTab(self.santeibi_widget, "算定日")        
+        # 算定日タブ: SI レコードから算定日を表示
+        self.santeibi_widget = SanteibiWidget(
+            self,
+            get_shinryo_name=self._get_shinryo_name,
+            get_comment_text=self._get_comment_text,
+        )
+        self.tab_widget.addTab(self.santeibi_widget, "算定日")
 
         # TODO: 「算定日」「レセプトプレビュー」「レセ電コード[個別]」用タブは
         # 後で空の QWidget を addTab しておけば OK
@@ -213,7 +218,14 @@ class ReceiptSummaryWidget(QWidget):
             lay.addStretch(1)
             self.tab_widget.addTab(page, title)
 
-        add_simple_tab("レセプトプレビュー", "【レセプトプレビュー】タブ（今後実装予定）")
+        # レセプトプレビュータブ: 実装済みウィジェット
+        self.preview_widget = ReceiptPreviewWidget(
+            self,
+            get_shinryo_name=self._get_shinryo_name,
+            get_comment_text=self._get_comment_text,
+        )
+        self.tab_widget.addTab(self.preview_widget, "レセプトプレビュー")
+        # プレースホルダ（レセ電コード[個別]）は従来通り
         add_simple_tab("レセ電コード[個別]", "【レセ電コード[個別]】タブ（今後実装予定）")
 
     # ─────────────────────────────
@@ -268,7 +280,10 @@ class ReceiptSummaryWidget(QWidget):
         
         # 算定日タブ: JD レコードをセット
         if hasattr(self, "santeibi_widget"):
-            self.santeibi_widget.set_from_receipt(receipt)        
+            self.santeibi_widget.set_from_receipt(receipt)
+        # レセプトプレビューワ
+        if hasattr(self, "preview_widget"):
+            self.preview_widget.set_from_receipt(receipt)
 
         # 下側テキスト: レコード一覧
         lines: list[str] = []
@@ -480,7 +495,9 @@ class ReceiptSummaryWidget(QWidget):
         if hasattr(self, "qual_widget"):
             self.qual_widget.clear()
         if hasattr(self, "santeibi_widget"):
-            self.santeibi_widget.clear()            
+            self.santeibi_widget.clear()
+        if hasattr(self, "preview_widget"):
+            self.preview_widget.clear()
 
         self.raw_view.clear()
         self.disease_table.setRowCount(0)
@@ -761,8 +778,15 @@ class SanteibiWidget(QWidget):
     """
     算定日タブ（ヘッダ + SIレコード一覧）
     """
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        get_shinryo_name: Optional[Callable[[str], str]] = None,
+        get_comment_text: Optional[Callable[[str], str]] = None,
+    ) -> None:
         super().__init__(parent)
+        self._get_shinryo_name = get_shinryo_name
+        self._get_comment_text = get_comment_text
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -799,7 +823,7 @@ class SanteibiWidget(QWidget):
 
         # ── 下側: SIレコード一覧 ─────────────────
         self.table = QTableWidget(self)
-        base_cols = ["識別", "負", "診療行為", "数量", "点数", "回数"]
+        base_cols = ["診療識別", "負担区分", "診療行為コード", "数量データ", "点数", "回数"]
         day_cols  = [str(d) for d in range(1, 32)]
         headers   = base_cols + day_cols
 
@@ -876,16 +900,24 @@ class SanteibiWidget(QWidget):
             # 5: 点数
             # 6: 回数
             # 7〜37: 算定日情報(1〜31日)
-            shikibetsu = get(1).strip()
-            futan      = get(2).strip()
-            shinryo    = get(3).strip()
-            suuryo     = get(4).strip()
-            tensu      = get(5).strip()
-            kaisuu     = get(6).strip()
+            shikibetsu    = get(1).strip()
+            futan         = get(2).strip()
+            shinryo_code  = get(3).strip()
+            suuryo        = get(4).strip()
+            tensu         = get(5).strip()
+            kaisuu        = get(6).strip()
+
+            # 診療行為マスタで名称に変換
+            shinryo_disp = shinryo_code
+            if self._get_shinryo_name is not None and shinryo_code:
+                name = self._get_shinryo_name(shinryo_code) or ""
+                if name:
+                    # 例: "111000110 初診料"
+                    shinryo_disp = f"{shinryo_code} {name}"
 
             self.table.insertRow(row_idx)
 
-            base_values = [shikibetsu, futan, shinryo, suuryo, tensu, kaisuu]
+            base_values = [shikibetsu, futan, shinryo_disp, suuryo, tensu, kaisuu]
             for col, val in enumerate(base_values):
                 self.table.setItem(row_idx, col, QTableWidgetItem(val))
 
@@ -900,3 +932,99 @@ class SanteibiWidget(QWidget):
                 self.table.setItem(row_idx, 6 + day - 1, item)
 
             row_idx += 1
+
+
+# ─────────────────────────────
+# レセプト簡易プレビューウィジェット
+# ─────────────────────────────
+class ReceiptPreviewWidget(QWidget):
+    """
+    レセプトプレビュータブ用の簡易テキストプレビューワ。
+    """
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        get_shinryo_name: Optional[Callable[[str], str]] = None,
+        get_comment_text: Optional[Callable[[str], str]] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._get_shinryo_name = get_shinryo_name
+        self._get_comment_text = get_comment_text
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        label = QLabel("レセプト簡易プレビュー", self)
+        layout.addWidget(label)
+        self.text_edit = QPlainTextEdit(self)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        # Monospace font if available
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.text_edit.setFont(font)
+        layout.addWidget(self.text_edit)
+
+    def clear(self) -> None:
+        self.text_edit.clear()
+
+    def set_from_receipt(self, receipt: Optional[UkeReceipt]) -> None:
+        self.clear()
+        if receipt is None or getattr(receipt, "header", None) is None:
+            return
+        h = receipt.header
+        lines = []
+        # Header
+        header_line = f"診療年月: {getattr(h, 'year_month', '-')}, 患者番号: {getattr(h, 'patient_id', '-')}, 氏名: {getattr(h, 'name', '-')}, 性別: {getattr(h, 'sex', '-')}, 生年月日: {getattr(h, 'birthday', '-')}"
+        lines.append(header_line)
+        lines.append("")
+        # 病名
+        lines.append("【傷病名】")
+        for rec in getattr(receipt, "records", []):
+            if getattr(rec, "record_type", "") != "SY":
+                continue
+            f = rec.fields
+            def get(i: int) -> str:
+                return f[i] if len(f) > i and f[i] is not None else ""
+            code = get(1).strip()
+            start_raw = get(2).strip()
+            tenki_raw = get(3).strip()
+            modifier_raw = get(4).strip()
+            name_in_sy = get(5).strip()
+            main_flag = get(6).strip()
+            mark = "★" if main_flag and main_flag != "0" else "・"
+            # For preview, just use name_in_sy if present, otherwise code
+            label = name_in_sy if name_in_sy else code
+            lines.append(f"{mark} {label}")
+        lines.append("")
+        # 診療行為
+        lines.append("【診療行為】")
+        for rec in getattr(receipt, "records", []):
+            if getattr(rec, "record_type", "") != "SI":
+                continue
+            f = rec.fields
+            def get(i: int) -> str:
+                return f[i] if len(f) > i and f[i] is not None else ""
+            shikibetsu = get(1).strip()
+            futan = get(2).strip()
+            shinryo_code = get(3).strip()
+            suuryo = get(4).strip()
+            tensu = get(5).strip()
+            kaisuu = get(6).strip()
+            shinryo_disp = shinryo_code
+            if self._get_shinryo_name is not None and shinryo_code:
+                name = self._get_shinryo_name(shinryo_code) or ""
+                if name:
+                    shinryo_disp = f"{shinryo_code} {name}"
+            # 算定日
+            days = []
+            for day in range(1, 32):
+                idx = 6 + day
+                if len(f) > idx and f[idx]:
+                    days.append(str(day))
+            days_str = ",".join(days) if days else "-"
+            lines.append(f"{shikibetsu}/{futan}  {shinryo_disp}  点数:{tensu}  回数:{kaisuu}  算定日:{days_str}")
+        text = "\n".join(lines)
+        self.text_edit.setPlainText(text)

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 import csv
 import io
+import json
 
 import chardet
 from PySide6.QtCore import Qt
@@ -34,6 +35,16 @@ from openreceview.parser.uke_parser import parse_uke_text, group_records_into_re
 from openreceview.models.uke_record import UkeRecord
 from openreceview.models.uke_receipt import UkeReceipt
 from openreceview.gui.receipt_summary_widget import ReceiptSummaryWidget
+from openreceview.master_loader import (
+    load_disease_master,
+    load_modifier_master,
+    load_shinryo_master,
+    load_chouzai_master,
+    load_drug_master,
+    load_material_master,
+    load_ward_master,
+    save_master_paths,
+)
 
 PREF_NAMES = {
     "01": "北海道", "02": "青森県", "03": "岩手県", "04": "宮城県", "05": "秋田県",
@@ -59,13 +70,6 @@ class MainWindow(QMainWindow):
     """
     OpenReceView の最小 GUI 版メインウィンドウ。
 
-    現時点では：
-      - [ファイル] メニューから UKE/CSV を開く
-      - 左ペイン: 行（レコード）の一覧
-      - 右ペイン: 選択した行の生データ表示
-
-    というシンプルな構成です。
-    後で「患者一覧」や「レセプト単位の構造」に差し替えやすいよう、
     1行 = 1レコードとして扱っています。
     """
 
@@ -92,7 +96,14 @@ class MainWindow(QMainWindow):
         self._disease_master: dict[str, dict[str, str]] = {}
         # 修飾語マスタ
         self._modifier_name_by_code: dict[str, str] = {}
-        self._modifier_kana_by_code: dict[str, str] = {} 
+        self._modifier_kana_by_code: dict[str, str] = {}
+        # 診療行為 / 調剤 / 医薬品 / 特定器材 / 病棟 / コメント マスタ
+        self._shinryo_master: dict[str, dict[str, str]] = {}
+        self._chouzai_master: dict[str, dict[str, str]] = {}
+        self._drug_master: dict[str, dict[str, str]] = {}
+        self._material_master: dict[str, dict[str, str]] = {}
+        self._ward_master: dict[str, dict[str, str]] = {}
+        self._comment_master: dict[str, dict[str, str]] = {}  # 将来: コメントコード→テキスト
 
         # 医療機関（IR）の情報を保持しておく
         self._facility_payer_code: str | None = None   # 支払機関連合種別 (1〜4)
@@ -113,6 +124,109 @@ class MainWindow(QMainWindow):
         # レセプト検索結果の状態
         self._receipt_search_hits: list[int] = []  # ヒットした receipt のインデックス一覧
         self._receipt_search_index: int = -1       # 現在参照中のヒット位置
+
+        # 起動時に前回保存されたマスタパスから自動読み込み
+        self._auto_load_masters_from_saved_paths()
+
+    def _auto_load_masters_from_saved_paths(self) -> None:
+        """前回保存したマスタファイルパスから、自動的にマスタを読み込む。
+
+        master_loader.save_master_paths() が書き出す JSON を読み取り、
+        存在するパスだけを対象に各マスタをロードする。
+        読み込みに失敗してもアプリ起動自体は継続する。
+        """
+        try:
+            # save_master_paths 側と同じ想定パス
+            config_path = Path.home() / ".openreceview_master_paths.json"
+            if not config_path.exists():
+                return
+
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            # 設定ファイル破損などは無視
+            return
+
+        # helper: パスリストを Path に変換し、実在するものだけ返す
+        def _existing_paths(key: str) -> list[Path]:
+            raw_list = data.get(key) or []
+            paths: list[Path] = []
+            for p in raw_list:
+                try:
+                    path_obj = Path(p)
+                except Exception:
+                    continue
+                if path_obj.is_file():
+                    paths.append(path_obj)
+            return paths
+
+        # 各マスタを順次ロード（存在するものだけ）
+        try:
+            disease_paths = _existing_paths("disease")
+            if disease_paths:
+                self._disease_master = load_disease_master(disease_paths)
+        except Exception:
+            pass
+
+        try:
+            modifier_paths = _existing_paths("modifier")
+            if modifier_paths:
+                name_by_code, kana_by_code = load_modifier_master(modifier_paths)
+                self._modifier_name_by_code = name_by_code
+                self._modifier_kana_by_code = kana_by_code
+        except Exception:
+            pass
+
+        try:
+            shinryo_paths = _existing_paths("shinryo")
+            if shinryo_paths:
+                self._shinryo_master = load_shinryo_master(shinryo_paths)
+        except Exception:
+            pass
+
+        try:
+            chouzai_paths = _existing_paths("chouzai")
+            if chouzai_paths:
+                self._chouzai_master = load_chouzai_master(chouzai_paths)
+        except Exception:
+            pass
+
+        try:
+            drug_paths = _existing_paths("drug")
+            if drug_paths:
+                self._drug_master = load_drug_master(drug_paths)
+        except Exception:
+            pass
+
+        try:
+            material_paths = _existing_paths("material")
+            if material_paths:
+                self._material_master = load_material_master(material_paths)
+        except Exception:
+            pass
+
+        try:
+            ward_paths = _existing_paths("ward")
+            if ward_paths:
+                self._ward_master = load_ward_master(ward_paths)
+        except Exception:
+            pass
+
+        # どれか一つでも読めていれば、ステータスバーに簡単なメッセージを出す
+        if any([
+            self._disease_master,
+            self._modifier_name_by_code,
+            self._shinryo_master,
+            self._chouzai_master,
+            self._drug_master,
+            self._material_master,
+            self._ward_master,
+        ]):
+            try:
+                self.statusBar().showMessage("前回のマスタ設定を自動読み込みしました。")
+            except Exception:
+                # statusBar 未初期化のタイミングでは何もしない
+                pass
+
 
     # ─────────────────────────────
     # UI 構築
@@ -149,7 +263,9 @@ class MainWindow(QMainWindow):
             get_disease_name=self._get_disease_name,
             get_disease_kana=self._get_disease_kana,
             get_modifier_name=self.get_modifier_name,
-            get_modifier_kana=self.get_modifier_kana,            
+            get_modifier_kana=self.get_modifier_kana,
+            get_shinryo_name=self.get_shinryo_name,
+            get_comment_text=self.get_comment_text,
         )
 
         facility_splitter.setStretchFactor(0, 1)
@@ -189,6 +305,8 @@ class MainWindow(QMainWindow):
             get_disease_kana=self._get_disease_kana,
             get_modifier_name=self.get_modifier_name,
             get_modifier_kana=self.get_modifier_kana,
+            get_shinryo_name=self.get_shinryo_name,
+            get_comment_text=self.get_comment_text,
         )
 
         receipt_splitter.addWidget(self.receipt_list)
@@ -290,7 +408,31 @@ class MainWindow(QMainWindow):
 
         # ★ 傷病名マスタ読込
         self.load_disease_master_action = QAction("傷病名マスタ読込(&D)...", self)
-        self.load_disease_master_action.triggered.connect(self._on_load_disease_master)        
+        self.load_disease_master_action.triggered.connect(self._on_load_disease_master)
+
+        # ★ 修飾語マスタ読込
+        self.load_modifier_master_action = QAction("修飾語マスタ読込(&Z)...", self)
+        self.load_modifier_master_action.triggered.connect(self._on_load_modifier_master)
+
+        # ★ 診療行為マスタ読込
+        self.load_shinryo_master_action = QAction("診療行為マスタ読込(&S)...", self)
+        self.load_shinryo_master_action.triggered.connect(self._on_load_shinryo_master)
+
+        # ★ 調剤行為マスタ読込
+        self.load_chouzai_master_action = QAction("調剤行為マスタ読込(&J)...", self)
+        self.load_chouzai_master_action.triggered.connect(self._on_load_chouzai_master)
+
+        # ★ 医薬品マスタ読込
+        self.load_drug_master_action = QAction("医薬品マスタ読込(&Y)...", self)
+        self.load_drug_master_action.triggered.connect(self._on_load_drug_master)
+
+        # ★ 特定器材マスタ読込
+        self.load_material_master_action = QAction("特定器材マスタ読込(&T)...", self)
+        self.load_material_master_action.triggered.connect(self._on_load_material_master)
+
+        # ★ 病棟コードマスタ読込
+        self.load_ward_master_action = QAction("病棟コードマスタ読込(&B)...", self)
+        self.load_ward_master_action.triggered.connect(self._on_load_ward_master)
 
     def _create_menus(self) -> None:
         menubar = self.menuBar()
@@ -308,9 +450,16 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.receipt_search_action)
         view_menu.addAction(self.receipt_search_next_action)
 
-        # ★ マスタメニュー
+        # マスタメニュー
         master_menu = menubar.addMenu("マスタ(&M)")
         master_menu.addAction(self.load_disease_master_action)
+        master_menu.addAction(self.load_modifier_master_action)
+        master_menu.addSeparator()
+        master_menu.addAction(self.load_shinryo_master_action)
+        master_menu.addAction(self.load_chouzai_master_action)
+        master_menu.addAction(self.load_drug_master_action)
+        master_menu.addAction(self.load_material_master_action)
+        master_menu.addAction(self.load_ward_master_action)
 
     def _create_status_bar(self) -> None:
         status = QStatusBar(self)
@@ -789,196 +938,269 @@ class MainWindow(QMainWindow):
             self._populate_points_summary()
 
     # ─────────────────────────────
-    # 傷病名マスタ読み込みハンドラ
+    # マスタ読み込みハンドラ
     # ─────────────────────────────
     def _on_load_disease_master(self) -> None:
-        """
-        [マスタ] → [傷病名マスタ読込] が押されたときに呼ばれる。
-        b / hb / Z（修飾語）など複数ファイルを選択可能にして、すべてマージする。
-        """
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "傷病名マスタファイルを選択（b / hb / Z をまとめて選択可）",
+            "傷病名マスタファイルを選択（b / hb をまとめて選択可）",
             "",
             "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
         )
         if not paths:
             return
 
-        # 一旦空にして、選択されたファイルを順にマージ
-        self._disease_master = {}
-        self._modifier_name_by_code.clear()
-        self._modifier_kana_by_code.clear()
-
-        total_disease_loaded = 0
-        total_modifier_loaded = 0
-
-        for path_str in paths:
-            path = Path(path_str)
-
-            # --- 軽く中身を見て「修飾語マスタ(Z)かどうか」を判定 ---
-            try:
-                raw = path.read_bytes()
-            except Exception as e:
-                QMessageBox.warning(
-                    self,
-                    "マスタ読み込みエラー",
-                    f"マスタファイルの読み込みに失敗しました。\n\n"
-                    f"ファイル: {path}\n"
-                    f"エラー: {e}",
-                )
-                continue
-
-            # 文字コードはざっくり cp932 優先、ダメなら utf-8
-            text: str
-            for enc in ("cp932", "utf-8"):
-                try:
-                    text = raw.decode(enc)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                text = raw.decode("cp932", errors="ignore")
-
-            # 先頭数行を使って区切りを判定
-            sample = "\n".join(text.splitlines()[:5])
-            if "\t" in sample and ("," not in sample or sample.count("\t") >= sample.count(",")):
-                delim = "\t"
-            else:
-                delim = ","
-
-            first_line = ""
-            for line in text.splitlines():
-                if line.strip():
-                    first_line = line
-                    break
-
-            if first_line:
-                try:
-                    first_row = next(csv.reader([first_line], delimiter=delim))
-                except Exception:
-                    # 何かあっても一応フォールバック
-                    first_row = first_line.split(delim)
-            else:
-                first_row = []
-
-            cols = [c.strip() for c in first_row]
-
-            second = cols[1] if len(cols) >= 2 else ""
-            # 引用符で囲まれていてもOKにしておく
-            second = second.strip('"').strip()
-
-            is_modifier = (second == "Z")
-
-            # 「2 列目が 'Z'」なら修飾語マスタとみなす
-            is_modifier = len(cols) >= 2 and cols[1].strip() == "Z"
-
-            if is_modifier:
-                loaded = self._load_single_modifier_master(path, text, delim)
-                total_modifier_loaded += loaded
-            else:
-                loaded = self._load_single_disease_master_from_text(path, text, delim)
-                total_disease_loaded += loaded
-
-        QMessageBox.information(
-            self,
-            "マスタ読込",
-            "傷病名マスタ / 修飾語マスタを読み込みました。\n"
-            f"ファイル数: {len(paths)}\n"
-            f"傷病名コード数: {len(self._disease_master):,}\n"
-            f"修飾語コード数: {len(self._modifier_name_by_code):,}",
-        )
-        self.statusBar().showMessage(
-            f"マスタ読込完了: 傷病名 {len(self._disease_master):,} コード, "
-            f"修飾語 {len(self._modifier_name_by_code):,} コード"
-        )
-
-    def _load_single_disease_master_from_text(
-        self,
-        path: Path,
-        text: str,
-        delimiter: str,
-    ) -> int:
-        """
-        すでに decode 済み文字列と区切り文字を受け取り、
-        傷病名マスタとして self._disease_master にマージする。
-        """
-        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-
-        loaded_rows = 0
-        for row in reader:
-            if not row:
-                continue
-
-            def safe(idx: int) -> str:
-                return row[idx].strip() if len(row) > idx and row[idx] is not None else ""
-
-            # コード: 3列目があればそれを優先、なければ 4列目
-            code = safe(2)  # 3rd column (0-based 2)
-            if not code:
-                code = safe(3)  # 4th column (0-based 3)
-
-            if not code:
-                continue  # コードがない行はスキップ
-
-            # 傷病名（漢字）: 6列目→8列目
-            name = safe(5)  # 6th column (0-based 5)
-            if not name:
-                name = safe(7)  # 8th column (0-based 7)
-
-            # カナ: 10列目
-            kana = safe(9)  # 10th column (0-based 9)
-
-            if not name and not kana:
-                # 名称情報が何もない行はスキップ
-                continue
-
-            self._disease_master[code] = {
-                "name": name,
-                "kana": kana,
-            }
-            loaded_rows += 1
-
-        self.statusBar().showMessage(
-            f"傷病名マスタ {path.name} を読み込みました（{loaded_rows:,} 行）"
-        )
-        return loaded_rows
-
-    def _load_single_disease_master(self, path: Path) -> int:
-        """
-        （互換用）単体で呼ぶ場合の傷病名マスタ読込。
-        今回の一括読み込みでは基本的に使わない想定。
-        """
         try:
-            raw = path.read_bytes()
+            path_objs = [Path(p) for p in paths]
+            master = load_disease_master(path_objs)
         except Exception as e:
             QMessageBox.warning(
                 self,
                 "傷病名マスタ読み込みエラー",
-                f"傷病名マスタの読み込みに失敗しました。\n\n"
-                f"ファイル: {path}\n"
-                f"エラー: {e}",
+                f"傷病名マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
             )
-            return 0
+            return
 
-        # 簡易エンコード判定
-        for enc in ("cp932", "utf-8"):
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = raw.decode("cp932", errors="ignore")
+        # 読み込んだ結果を自分のフィールドに反映
+        self._disease_master = master
+        save_master_paths("disease", path_objs)
 
-        sample = "\n".join(text.splitlines()[:50])
+        QMessageBox.information(
+            self,
+            "傷病名マスタ読込",
+            f"傷病名マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"傷病名コード数: {len(self._disease_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"傷病名マスタ読込完了: {len(self._disease_master):,} コード"
+        )
+
+    def _on_load_modifier_master(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "修飾語マスタファイルを選択（Z マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
         try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",\t")
-            delimiter = dialect.delimiter
-        except Exception:
-            delimiter = "\t" if "\t" in sample else ","
+            path_objs = [Path(p) for p in paths]
+            name_by_code, kana_by_code = load_modifier_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "修飾語マスタ読み込みエラー",
+                f"修飾語マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
 
-        return self._load_single_disease_master_from_text(path, text, delimiter)
+        self._modifier_name_by_code = name_by_code
+        self._modifier_kana_by_code = kana_by_code
+        save_master_paths("modifier", path_objs)
+
+        QMessageBox.information(
+            self,
+            "修飾語マスタ読込",
+            f"修飾語マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"修飾語コード数: {len(self._modifier_name_by_code):,}",
+        )
+        self.statusBar().showMessage(
+            f"修飾語マスタ読込完了: {len(self._modifier_name_by_code):,} コード"
+        )
+
+    def _on_load_shinryo_master(self) -> None:
+        """
+        [マスタ] → [診療行為マスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "診療行為マスタファイルを選択（S マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_shinryo_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "診療行為マスタ読み込みエラー",
+                f"診療行為マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._shinryo_master = master
+        save_master_paths("shinryo", path_objs)
+
+        QMessageBox.information(
+            self,
+            "診療行為マスタ読込",
+            f"診療行為マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"診療行為コード数: {len(self._shinryo_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"診療行為マスタ読込完了: {len(self._shinryo_master):,} コード"
+        )
+
+    def _on_load_chouzai_master(self) -> None:
+        """
+        [マスタ] → [調剤行為マスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "調剤行為マスタファイルを選択（M マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_chouzai_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "調剤行為マスタ読み込みエラー",
+                f"調剤行為マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._chouzai_master = master
+        save_master_paths("chouzai", path_objs)
+
+        QMessageBox.information(
+            self,
+            "調剤行為マスタ読込",
+            f"調剤行為マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"調剤行為コード数: {len(self._chouzai_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"調剤行為マスタ読込完了: {len(self._chouzai_master):,} コード"
+        )
+
+    def _on_load_drug_master(self) -> None:
+        """
+        [マスタ] → [医薬品マスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "医薬品マスタファイルを選択（Y マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_drug_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "医薬品マスタ読み込みエラー",
+                f"医薬品マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._drug_master = master
+        save_master_paths("drug", path_objs)
+
+        QMessageBox.information(
+            self,
+            "医薬品マスタ読込",
+            f"医薬品マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"医薬品コード数: {len(self._drug_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"医薬品マスタ読込完了: {len(self._drug_master):,} コード"
+        )
+
+    def _on_load_material_master(self) -> None:
+        """
+        [マスタ] → [特定器材マスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "特定器材マスタファイルを選択（T マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_material_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "特定器材マスタ読み込みエラー",
+                f"特定器材マスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._material_master = master
+        save_master_paths("material", path_objs)
+
+        QMessageBox.information(
+            self,
+            "特定器材マスタ読込",
+            f"特定器材マスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"特定器材コード数: {len(self._material_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"特定器材マスタ読込完了: {len(self._material_master):,} コード"
+        )
+
+    def _on_load_ward_master(self) -> None:
+        """
+        [マスタ] → [病棟コードマスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "病棟コードマスタファイルを選択（病棟マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_ward_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "病棟コードマスタ読み込みエラー",
+                f"病棟コードマスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._ward_master = master
+        save_master_paths("ward", path_objs)
+
+        QMessageBox.information(
+            self,
+            "病棟コードマスタ読込",
+            f"病棟コードマスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"病棟コード数: {len(self._ward_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"病棟コードマスタ読込完了: {len(self._ward_master):,} コード"
+        )
 
     def _get_disease_name(self, code: str) -> str:
         """
@@ -992,7 +1214,7 @@ class MainWindow(QMainWindow):
             return ""
         # 将来的に「漢字/カナ切替」したくなったらここで分岐させる
         return info.get("name") or ""
-    
+
     def _get_disease_kana(self, code: str) -> str:
         """
         傷病名コード → カナ傷病名（あれば）
@@ -1003,59 +1225,6 @@ class MainWindow(QMainWindow):
         if not info:
             return ""
         return info.get("kana") or ""
-    
-    # ─────────────────────────────
-    # 修飾語マスタ読み込みハンドラ
-    # ─────────────────────────────
-    def _load_single_modifier_master(self, path: Path, text: str, delimiter: str) -> int:
-        """
-        修飾語マスタ(Z…)を読み込んで
-          self._modifier_name_by_code / self._modifier_kana_by_code
-        にマージする。
-        想定フォーマット:
-          1列目: フラグ(有効/無効など)
-          2列目: 'Z'
-          3列目: 修飾語コード
-          7列目: 修飾語名
-          10列目: 修飾語カナ
-        """
-        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-
-        loaded_rows = 0
-        for row in reader:
-            if not row:
-                continue
-
-            def safe(idx: int) -> str:
-                return row[idx].strip() if len(row) > idx and row[idx] is not None else ""
-
-            flag = safe(0)
-            kind = safe(1)   # 2列目
-            code = safe(2)   # 3列目
-
-            # 2列目が Z でないものは修飾語マスタ対象外
-            if kind and kind != "Z":
-                continue
-            if not code:
-                continue
-
-            name = safe(6)   # 7列目
-            kana = safe(9)   # 10列目
-
-            # フラグで「明らかに無効」を除外したければここで条件追加
-            # 例: if flag in ("0", "9"): continue
-
-            if name:
-                self._modifier_name_by_code[code] = name
-            if kana:
-                self._modifier_kana_by_code[code] = kana
-
-            loaded_rows += 1
-
-        self.statusBar().showMessage(
-            f"修飾語マスタ {path.name} を読み込みました（{loaded_rows:,} 行）"
-        )
-        return loaded_rows
 
     def get_modifier_name(self, code: str) -> str:
         if not code:
@@ -1066,6 +1235,27 @@ class MainWindow(QMainWindow):
         if not code:
             return ""
         return self._modifier_kana_by_code.get(code, "")
+
+    def get_shinryo_name(self, code: str) -> str:
+        """診療行為コード → 診療行為名称（なければ空文字）。"""
+        if not code:
+            return ""
+        info = self._shinryo_master.get(code.strip())
+        if not info:
+            return ""
+        # マスタ側のキー名は実装に合わせて name / text などを想定
+        return info.get("name") or info.get("text") or ""
+
+    def get_comment_text(self, code: str) -> str:
+        """コメントコード → コメント文字列（なければ空文字）。
+        現状は将来のコメントマスタ読込に備えたフックとして利用します。
+        """
+        if not code:
+            return ""
+        info = self._comment_master.get(code.strip())
+        if not info:
+            return ""
+        return info.get("text") or info.get("name") or ""
 
     # ─────────────────────────────
     # 検索ロジック
