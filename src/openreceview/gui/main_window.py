@@ -43,8 +43,14 @@ from openreceview.master_loader import (
     load_drug_master,
     load_material_master,
     load_ward_master,
+    load_comment_master,
     save_master_paths,
 )
+from openreceview.gui.header_search import (
+    HeaderSearchDialog,
+    search_receipts_by_header,
+)
+from openreceview.gui.global_search import GlobalSearchDialog
 
 PREF_NAMES = {
     "01": "北海道", "02": "青森県", "03": "岩手県", "04": "宮城県", "05": "秋田県",
@@ -108,6 +114,8 @@ class MainWindow(QMainWindow):
         # 医療機関（IR）の情報を保持しておく
         self._facility_payer_code: str | None = None   # 支払機関連合種別 (1〜4)
         self._facility_pref_code: str | None = None    # 都道府県コード (01〜47)
+        # 総合検索表示をモードレスに
+        self._global_search_dialog: GlobalSearchDialog | None = None
 
         # 種別点数情報の集計モード
         self.points_group_mode = self.GROUP_ALL_WIDE_BY_PREF
@@ -211,6 +219,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            comment_paths = _existing_paths("comment")
+            if comment_paths:
+                self._comment_master = load_comment_master(comment_paths)
+        except Exception:
+            pass
+
         # どれか一つでも読めていれば、ステータスバーに簡単なメッセージを出す
         if any([
             self._disease_master,
@@ -220,6 +235,7 @@ class MainWindow(QMainWindow):
             self._drug_master,
             self._material_master,
             self._ward_master,
+            self._comment_master,
         ]):
             try:
                 self.statusBar().showMessage("前回のマスタ設定を自動読み込みしました。")
@@ -406,6 +422,18 @@ class MainWindow(QMainWindow):
         self.receipt_search_next_action.setShortcut("Ctrl+Shift+N")
         self.receipt_search_next_action.triggered.connect(self._on_receipt_search_next)
 
+        # ★ ヘッダ検索（レセプトヘッダ項目を対象にした検索）
+        self.header_search_action = QAction("ヘッダ検索(&H)...", self)
+        # お好みでショートカットは変更可（ここでは Ctrl+H とする）
+        self.header_search_action.setShortcut("Ctrl+H")
+        self.header_search_action.triggered.connect(self._on_header_search)
+
+        # ★ 詳細検索（グローバル検索ダイアログ）
+        self.global_search_action = QAction("詳細検索(&S)...", self)
+        # 既存のショートカットと被らないように Ctrl+Alt+F を割り当て
+        self.global_search_action.setShortcut("Ctrl+Alt+F")
+        self.global_search_action.triggered.connect(self._on_global_search)
+
         # ★ 傷病名マスタ読込
         self.load_disease_master_action = QAction("傷病名マスタ読込(&D)...", self)
         self.load_disease_master_action.triggered.connect(self._on_load_disease_master)
@@ -434,6 +462,10 @@ class MainWindow(QMainWindow):
         self.load_ward_master_action = QAction("病棟コードマスタ読込(&B)...", self)
         self.load_ward_master_action.triggered.connect(self._on_load_ward_master)
 
+        # ★ コメントマスタ読込
+        self.load_comment_master_action = QAction("コメントマスタ読込(&C)...", self)
+        self.load_comment_master_action.triggered.connect(self._on_load_comment_master)
+
     def _create_menus(self) -> None:
         menubar = self.menuBar()
 
@@ -444,9 +476,17 @@ class MainWindow(QMainWindow):
 
         # 表示メニュー（検索系）
         view_menu = menubar.addMenu("表示(&V)")
+        # ── レコード単位の簡易検索 ──
         view_menu.addAction(self.search_action)
         view_menu.addAction(self.search_next_action)
         view_menu.addSeparator()
+        # ── ヘッダ検索 ──
+        view_menu.addAction(self.header_search_action)
+        view_menu.addSeparator()
+        # ── 詳細検索（専用ウインドウ） ──
+        view_menu.addAction(self.global_search_action)
+        view_menu.addSeparator()
+        # ── レセプト単位の全文検索 ──
         view_menu.addAction(self.receipt_search_action)
         view_menu.addAction(self.receipt_search_next_action)
 
@@ -460,6 +500,7 @@ class MainWindow(QMainWindow):
         master_menu.addAction(self.load_drug_master_action)
         master_menu.addAction(self.load_material_master_action)
         master_menu.addAction(self.load_ward_master_action)
+        master_menu.addAction(self.load_comment_master_action)
 
     def _create_status_bar(self) -> None:
         status = QStatusBar(self)
@@ -546,6 +587,10 @@ class MainWindow(QMainWindow):
             f"{path.name} を読み込みました "
             f"(選択エンコーディング: {best_encoding}, スコア: {best_score:.0f})"
         )
+        
+        if self._global_search_dialog is not None:
+            # GlobalSearchDialog 側に「レセプト一覧を差し替えるメソッド」を用意しておく想定
+            self._global_search_dialog.update_receipts(self._receipts)
 
     def _populate_record_list(self) -> None:
         """
@@ -1246,6 +1291,24 @@ class MainWindow(QMainWindow):
         # マスタ側のキー名は実装に合わせて name / text などを想定
         return info.get("name") or info.get("text") or ""
 
+    def get_drug_name(self, code: str) -> str:
+        """医薬品コード → 医薬品名称（なければ空文字）。"""
+        if not code:
+            return ""
+        info = self._drug_master.get(code.strip())
+        if not info:
+            return ""
+        return info.get("name") or info.get("text") or ""
+
+    def get_material_name(self, code: str) -> str:
+        """特定器材コード → 器材名称（なければ空文字）。"""
+        if not code:
+            return ""
+        info = self._material_master.get(code.strip())
+        if not info:
+            return ""
+        return info.get("name") or info.get("text") or ""
+
     def get_comment_text(self, code: str) -> str:
         """コメントコード → コメント文字列（なければ空文字）。
         現状は将来のコメントマスタ読込に備えたフックとして利用します。
@@ -1260,6 +1323,122 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────
     # 検索ロジック
     # ─────────────────────────────
+    def _jump_to_receipt(self, index: int, source: str = "検索") -> None:
+        """
+        レセプト一覧タブで指定インデックスのレセプトを選択・表示する共通ヘルパー。
+        """
+        if index < 0 or index >= len(self._receipts):
+            return
+
+        self.tabs.setCurrentIndex(self.TAB_RECEIPTS)
+        self.receipt_list.setCurrentRow(index)
+        self.receipt_list.scrollToItem(self.receipt_list.currentItem())
+
+        receipt = self._receipts[index]
+        h = receipt.header
+        if h:
+            msg = (
+                f"{source}: レセプト {receipt.index} "
+                f"(患者番号={h.patient_id or '-'}, 診療年月={h.year_month or '-'}) を表示中"
+            )
+        else:
+            msg = f"{source}: レセプト {receipt.index} を表示中"
+
+        self.statusBar().showMessage(msg)
+
+    def _on_global_search(self) -> None:
+        """
+        表示 → 詳細検索 (Ctrl+Alt+F)
+        専用の検索ウインドウ（GlobalSearchDialog）を開き、
+        名前・患者番号・レセプト番号・病名・医薬品・診療行為など
+        複数条件での検索を行う。
+        """
+        if not self._receipts:
+            QMessageBox.information(self, "詳細検索", "レセプトが読み込まれていません。")
+            return
+
+        # GlobalSearchDialog 側で結果一覧を表示し、
+        # ダブルクリックなどで _jump_to_receipt を呼び出す前提のインターフェースにしておく
+        if self._global_search_dialog is None:
+            dlg = GlobalSearchDialog(
+                parent=self,
+                receipts=self._receipts,
+                on_jump_to_receipt=self._jump_to_receipt,
+                get_disease_name=self._get_disease_name,
+                get_modifier_name=self.get_modifier_name,
+                get_shinryo_name=self.get_shinryo_name,
+                get_drug_name=self.get_drug_name,
+                get_material_name=self.get_material_name,
+                get_comment_text=self.get_comment_text,
+            )
+            dlg.finished.connect(
+                lambda _result: setattr(self, "_global_search_dialog", None)
+            )
+            self._global_search_dialog = dlg
+        
+        dlg = self._global_search_dialog
+        
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_header_search(self) -> None:
+        """
+        表示 → ヘッダ検索 (Ctrl+H)
+        レセプトヘッダ情報（患者番号・氏名・診療年月など）を対象に検索する。
+        HeaderSearchDialog で条件を入力し、search_receipts_by_header() でヒットした
+        レセプトにジャンプする。
+        """
+        if not self._receipts:
+            QMessageBox.information(self, "ヘッダ検索", "レセプトが読み込まれていません。")
+            return
+
+        # ヘッダ検索ダイアログを表示
+        dlg = HeaderSearchDialog(self)
+
+        # exec() は Accept/Reject を int で返す（1=Accepted, 0=Rejected）
+        result = dlg.exec()
+        if result != 1:
+            # キャンセル時などは何もしない
+            return
+
+        # 条件の取得（実装に合わせて get_conditions() 優先、なければ .conditions を見る）
+        conditions: dict = {}
+        if hasattr(dlg, "get_conditions"):
+            try:
+                conditions = dlg.get_conditions()  # type: ignore[assignment]
+            except Exception:
+                conditions = {}
+        elif hasattr(dlg, "conditions"):
+            try:
+                conditions = getattr(dlg, "conditions") or {}
+            except Exception:
+                conditions = {}
+
+        # 条件が空でも search_receipts_by_header 側で適切に解釈する前提
+        hits = search_receipts_by_header(self._receipts, conditions)
+
+        # 結果を保持して「レセプト次を検索」と連携
+        self._receipt_search_hits = hits
+        self._receipt_search_index = -1
+
+        if not hits:
+            QMessageBox.information(self, "ヘッダ検索", "条件に一致するレセプトは見つかりませんでした。")
+            self.statusBar().showMessage("ヘッダ検索: ヒット 0 件")
+            return
+
+        # 最初のヒットに移動
+        self._receipt_search_index = 0
+        first_idx = self._receipt_search_hits[self._receipt_search_index]
+
+        self.tabs.setCurrentIndex(self.TAB_RECEIPTS)  # レセプト一覧タブへ
+        self.receipt_list.setCurrentRow(first_idx)
+        self.receipt_list.scrollToItem(self.receipt_list.currentItem())
+
+        self.statusBar().showMessage(
+            f"ヘッダ検索: {len(hits)} 件ヒット / 1 件目を表示"
+        )
+
     def _on_search(self) -> None:
         """
         表示 → 検索 (Ctrl+F)
@@ -1510,3 +1689,41 @@ class MainWindow(QMainWindow):
             # それ以前は素直に西暦で返す
             return f"{year}.{month:02d}"
 
+
+    def _on_load_comment_master(self) -> None:
+        """
+        [マスタ] → [コメントマスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "コメントマスタファイルを選択（C マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_comment_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "コメントマスタ読み込みエラー",
+                f"コメントマスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._comment_master = master
+        save_master_paths("comment", path_objs)
+
+        QMessageBox.information(
+            self,
+            "コメントマスタ読込",
+            f"コメントマスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"コメントコード数: {len(self._comment_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"コメントマスタ読込完了: {len(self._comment_master):,} コード"
+        )

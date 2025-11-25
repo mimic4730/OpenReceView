@@ -123,6 +123,10 @@ class ReceiptSummaryWidget(QWidget):
         self.lbl_insurer       = add_header_item(8, "保険者番号")
         self.lbl_days          = add_header_item(9,  "診療実日数")
         self.lbl_total_points  = add_header_item(10, "合計点数【イ】")
+        
+        # ★ 点数チェック用
+        self.lbl_calc_points   = add_header_item(11, "再計算点数（SI）")
+        self.lbl_points_diff   = add_header_item(12, "差分（再計算 − 合計）")        
 
         # ── 中段: 傷病名一覧 + 表記設定 ─────────────────
         disease_frame = QFrame(splitter)
@@ -205,7 +209,7 @@ class ReceiptSummaryWidget(QWidget):
         )
         self.tab_widget.addTab(self.santeibi_widget, "算定日")
 
-        # TODO: 「算定日」「レセプトプレビュー」「レセ電コード[個別]」用タブは
+        # TODO:「レセ電コード[個別]」用タブは
         # 後で空の QWidget を addTab しておけば OK
 
         # =========================================================
@@ -273,6 +277,10 @@ class ReceiptSummaryWidget(QWidget):
         self.lbl_insurer.setText(insurer)
         self.lbl_days.setText(days)
         self.lbl_total_points.setText(total_points)
+        
+        # 点数チェック（HO 合計点数 vs SI 再計算）
+        if self._current_receipt is not None:
+            self._update_points_check(self._current_receipt, total_points)        
 
         # 資格確認等タブ: SN レコードをセット
         if hasattr(self, "qual_widget"):
@@ -293,6 +301,71 @@ class ReceiptSummaryWidget(QWidget):
 
         # 傷病名一覧
         self._populate_diseases(receipt)
+
+    # ─────────────────────────────
+    # 点数再計算（SI → 合計点）
+    # ─────────────────────────────
+    def _calc_points_from_si(self, receipt: UkeReceipt) -> int:
+        """
+        SIレコードから合計点数を概算する。
+
+        現時点では単純に
+            合計 = Σ (点数フィールド × 回数フィールド)
+        として計算します。
+        """
+        total = 0
+
+        for rec in receipt.records:
+            if rec.record_type != "SI":
+                continue
+
+            f = rec.fields
+
+            def to_int(val: str, default: int = 0) -> int:
+                val = (val or "").strip()
+                if not val:
+                    return default
+                try:
+                    # 小数が来ることは少ないはずですが念のため
+                    return int(float(val))
+                except ValueError:
+                    return default
+
+            tensu_raw  = f[5] if len(f) > 5 else ""
+            kaisuu_raw = f[6] if len(f) > 6 else ""
+
+            tensu  = to_int(tensu_raw, 0)
+            kaisuu = to_int(kaisuu_raw, 1)  # 回数が空 or 0 の場合は 1 回とみなす
+
+            total += tensu * (kaisuu if kaisuu > 0 else 1)
+
+        return total
+
+    def _update_points_check(self, receipt: UkeReceipt, ho_total_points: str | None) -> None:
+        """
+        HO の合計点数と SI 再計算値をヘッダに表示し、差分があれば強調表示。
+        """
+        # SI から再計算
+        calc_total = self._calc_points_from_si(receipt)
+
+        # HO 側の合計点数を int に
+        ho_str = (ho_total_points or "").strip()
+        try:
+            ho_total = int(float(ho_str)) if ho_str else 0
+        except ValueError:
+            ho_total = 0
+
+        diff = calc_total - ho_total
+
+        # 表示
+        self.lbl_calc_points.setText(str(calc_total) if calc_total else "-")
+        self.lbl_points_diff.setText(str(diff) if diff else "0")
+
+        # 差分があれば赤字で強調
+        if diff != 0:
+            self.lbl_points_diff.setStyleSheet("color: red;")
+        else:
+            self.lbl_points_diff.setStyleSheet("")  # デフォルトに戻す
 
     # ─────────────────────────────
     # 傷病名一覧の生成
@@ -489,6 +562,8 @@ class ReceiptSummaryWidget(QWidget):
             self.lbl_insurer,
             self.lbl_days,
             self.lbl_total_points,
+            self.lbl_calc_points,
+            self.lbl_points_diff,
         ]:
             lbl.setText("-")
 
@@ -776,7 +851,7 @@ class QualificationWidget(QWidget):
 
 class SanteibiWidget(QWidget):
     """
-    算定日タブ（ヘッダ + SIレコード一覧）
+    算定日タブ（ヘッダ + SI / IY / TO / CO レコード一覧）
     """
     def __init__(
         self,
@@ -881,43 +956,56 @@ class SanteibiWidget(QWidget):
         rec_type = getattr(h, "receipt_type", None)
         self.lbl_san_type.setText(rec_type or "-")
 
-        # ── SIレコード一覧 ──
+        # ── SI / IY / TO / CO レコード一覧 ──
         row_idx = 0
         for rec in receipt.records:
-            if rec.record_type != "SI":
+            # 対象とするレコード: 診療行為(SI) / 医薬品(IY) / 特定器材(TO) / コメント(CO)
+            if rec.record_type not in ("SI", "IY", "TO", "CO"):
                 continue
 
             f = rec.fields
+            rec_type = rec.record_type
 
             def get(i: int) -> str:
                 return f[i] if len(f) > i and f[i] else ""
 
-            # ★ SIレコード構造（仮置き）
+            # 共通構造（SI / IY / TO / CO）
             # 1: 診療識別
             # 2: 負担区分
-            # 3: 診療行為コード
+            # 3: コード（診療行為コード / 医薬品コード / 特定器材コード / コメントコード）
             # 4: 数量データ
             # 5: 点数
             # 6: 回数
-            # 7〜37: 算定日情報(1〜31日)
+            # 7〜37: 算定日情報(1〜31日) を想定
             shikibetsu    = get(1).strip()
             futan         = get(2).strip()
-            shinryo_code  = get(3).strip()
+            code          = get(3).strip()
             suuryo        = get(4).strip()
             tensu         = get(5).strip()
             kaisuu        = get(6).strip()
 
-            # 診療行為マスタで名称に変換
-            shinryo_disp = shinryo_code
-            if self._get_shinryo_name is not None and shinryo_code:
-                name = self._get_shinryo_name(shinryo_code) or ""
-                if name:
-                    # 例: "111000110 初診料"
-                    shinryo_disp = f"{shinryo_code} {name}"
+            # コード表示の組み立て
+            code_disp = code
+
+            if rec_type == "SI":
+                # 診療行為マスタで名称に変換
+                if self._get_shinryo_name is not None and code:
+                    name = self._get_shinryo_name(code) or ""
+                    if name:
+                        # 例: "111000110 初診料"
+                        code_disp = f"{code} {name}"
+            elif rec_type == "CO":
+                # コメントマスタでコメント名称に変換
+                if self._get_comment_text is not None and code:
+                    text = self._get_comment_text(code) or ""
+                    if text:
+                        code_disp = f"{code} {text}"
+            # IY / TO は今のところコードのみ表示だが、
+            # 将来 get_iyakuhin_name / get_tokutei_kizai_name を追加すればここで展開可能。
 
             self.table.insertRow(row_idx)
 
-            base_values = [shikibetsu, futan, shinryo_disp, suuryo, tensu, kaisuu]
+            base_values = [shikibetsu, futan, code_disp, suuryo, tensu, kaisuu]
             for col, val in enumerate(base_values):
                 self.table.setItem(row_idx, col, QTableWidgetItem(val))
 

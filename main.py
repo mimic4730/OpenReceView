@@ -23,12 +23,12 @@ if str(SRC_DIR) not in sys.path:
 from openreceview.gui.main_window import MainWindow  # noqa: E402
 
 
-def main() -> None:
+def main() -> int:
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    win = MainWindow()
+    win.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
