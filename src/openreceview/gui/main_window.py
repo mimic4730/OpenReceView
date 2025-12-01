@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Tuple
 import csv
 import io
 import json
+from datetime import datetime
 
 import chardet
 from PySide6.QtCore import Qt
@@ -172,6 +173,7 @@ class MainWindow(QMainWindow):
             disease_paths = _existing_paths("disease")
             if disease_paths:
                 self._disease_master = load_disease_master(disease_paths)
+                self._update_master_status("disease")
         except Exception:
             pass
 
@@ -181,6 +183,7 @@ class MainWindow(QMainWindow):
                 name_by_code, kana_by_code = load_modifier_master(modifier_paths)
                 self._modifier_name_by_code = name_by_code
                 self._modifier_kana_by_code = kana_by_code
+                self._update_master_status("modifier")
         except Exception:
             pass
 
@@ -188,6 +191,7 @@ class MainWindow(QMainWindow):
             shinryo_paths = _existing_paths("shinryo")
             if shinryo_paths:
                 self._shinryo_master = load_shinryo_master(shinryo_paths)
+                self._update_master_status("shinryo")
         except Exception:
             pass
 
@@ -195,6 +199,7 @@ class MainWindow(QMainWindow):
             chouzai_paths = _existing_paths("chouzai")
             if chouzai_paths:
                 self._chouzai_master = load_chouzai_master(chouzai_paths)
+                self._update_master_status("chouzai")
         except Exception:
             pass
 
@@ -202,6 +207,7 @@ class MainWindow(QMainWindow):
             drug_paths = _existing_paths("drug")
             if drug_paths:
                 self._drug_master = load_drug_master(drug_paths)
+                self._update_master_status("drug")
         except Exception:
             pass
 
@@ -209,6 +215,7 @@ class MainWindow(QMainWindow):
             material_paths = _existing_paths("material")
             if material_paths:
                 self._material_master = load_material_master(material_paths)
+                self._update_master_status("material")
         except Exception:
             pass
 
@@ -216,6 +223,7 @@ class MainWindow(QMainWindow):
             ward_paths = _existing_paths("ward")
             if ward_paths:
                 self._ward_master = load_ward_master(ward_paths)
+                self._update_master_status("ward")
         except Exception:
             pass
 
@@ -223,6 +231,7 @@ class MainWindow(QMainWindow):
             comment_paths = _existing_paths("comment")
             if comment_paths:
                 self._comment_master = load_comment_master(comment_paths)
+                self._update_master_status("comment")
         except Exception:
             pass
 
@@ -242,7 +251,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 # statusBar 未初期化のタイミングでは何もしない
                 pass
-
 
     # ─────────────────────────────
     # UI 構築
@@ -282,6 +290,10 @@ class MainWindow(QMainWindow):
             get_modifier_kana=self.get_modifier_kana,
             get_shinryo_name=self.get_shinryo_name,
             get_comment_text=self.get_comment_text,
+            get_iyakuhin_name=self.get_iyakuhin_name,
+            get_tokutei_kizai_name=self.get_tokutei_kizai_name,
+            is_disease_abolished=self.is_disease_abolished,
+            is_shinryo_abolished=self.is_shinryo_abolished,
         )
 
         facility_splitter.setStretchFactor(0, 1)
@@ -323,6 +335,10 @@ class MainWindow(QMainWindow):
             get_modifier_kana=self.get_modifier_kana,
             get_shinryo_name=self.get_shinryo_name,
             get_comment_text=self.get_comment_text,
+            get_iyakuhin_name=self.get_iyakuhin_name,
+            get_tokutei_kizai_name=self.get_tokutei_kizai_name,
+            is_disease_abolished=self.is_disease_abolished,
+            is_shinryo_abolished=self.is_shinryo_abolished,
         )
 
         receipt_splitter.addWidget(self.receipt_list)
@@ -410,61 +426,86 @@ class MainWindow(QMainWindow):
         self.search_next_action.setShortcut(QKeySequence.FindNext)  # 通常 F3
         self.search_next_action.triggered.connect(self._on_search_next)
 
-        # ★ レセプト検索
+        # レセプト検索
         self.receipt_search_action = QAction("レセプト検索(&R)...", self)
         # Ctrl+Shift+F にしておく（お好みで変更可）
         self.receipt_search_action.setShortcut("Ctrl+Shift+F")
         self.receipt_search_action.triggered.connect(self._on_receipt_search)
 
-        # ★ レセプト 次を検索
+        # レセプト 次を検索
         self.receipt_search_next_action = QAction("レセプト次を検索(&X)", self)
         # Ctrl+Shift+N にしておく
         self.receipt_search_next_action.setShortcut("Ctrl+Shift+N")
         self.receipt_search_next_action.triggered.connect(self._on_receipt_search_next)
 
-        # ★ ヘッダ検索（レセプトヘッダ項目を対象にした検索）
+        # ヘッダ検索（レセプトヘッダ項目を対象にした検索）
         self.header_search_action = QAction("ヘッダ検索(&H)...", self)
         # お好みでショートカットは変更可（ここでは Ctrl+H とする）
         self.header_search_action.setShortcut("Ctrl+H")
         self.header_search_action.triggered.connect(self._on_header_search)
 
-        # ★ 詳細検索（グローバル検索ダイアログ）
+        # 詳細検索（グローバル検索ダイアログ）
         self.global_search_action = QAction("詳細検索(&S)...", self)
         # 既存のショートカットと被らないように Ctrl+Alt+F を割り当て
         self.global_search_action.setShortcut("Ctrl+Alt+F")
         self.global_search_action.triggered.connect(self._on_global_search)
 
-        # ★ 傷病名マスタ読込
+        # 傷病名マスタ読込
         self.load_disease_master_action = QAction("傷病名マスタ読込(&D)...", self)
         self.load_disease_master_action.triggered.connect(self._on_load_disease_master)
 
-        # ★ 修飾語マスタ読込
+        # 修飾語マスタ読込
         self.load_modifier_master_action = QAction("修飾語マスタ読込(&Z)...", self)
         self.load_modifier_master_action.triggered.connect(self._on_load_modifier_master)
 
-        # ★ 診療行為マスタ読込
+        # 診療行為マスタ読込
         self.load_shinryo_master_action = QAction("診療行為マスタ読込(&S)...", self)
         self.load_shinryo_master_action.triggered.connect(self._on_load_shinryo_master)
 
-        # ★ 調剤行為マスタ読込
+        # 調剤行為マスタ読込
         self.load_chouzai_master_action = QAction("調剤行為マスタ読込(&J)...", self)
         self.load_chouzai_master_action.triggered.connect(self._on_load_chouzai_master)
 
-        # ★ 医薬品マスタ読込
+        # 医薬品マスタ読込
         self.load_drug_master_action = QAction("医薬品マスタ読込(&Y)...", self)
         self.load_drug_master_action.triggered.connect(self._on_load_drug_master)
 
-        # ★ 特定器材マスタ読込
+        # 特定器材マスタ読込
         self.load_material_master_action = QAction("特定器材マスタ読込(&T)...", self)
         self.load_material_master_action.triggered.connect(self._on_load_material_master)
 
-        # ★ 病棟コードマスタ読込
+        # 病棟コードマスタ読込
         self.load_ward_master_action = QAction("病棟コードマスタ読込(&B)...", self)
         self.load_ward_master_action.triggered.connect(self._on_load_ward_master)
 
-        # ★ コメントマスタ読込
+        # コメントマスタ読込
         self.load_comment_master_action = QAction("コメントマスタ読込(&C)...", self)
         self.load_comment_master_action.triggered.connect(self._on_load_comment_master)
+        
+        # ─────────────────────────────
+        # マスタ読込状況表示用（メニューに出すだけの読み取り専用アクション）
+        # ─────────────────────────────
+        self.master_status_disease  = QAction("傷病名: 未読込", self)
+        self.master_status_modifier = QAction("修飾語: 未読込", self)
+        self.master_status_shinryo  = QAction("診療行為: 未読込", self)
+        self.master_status_chouzai  = QAction("調剤行為: 未読込", self)
+        self.master_status_drug     = QAction("医薬品: 未読込", self)
+        self.master_status_material = QAction("特定器材: 未読込", self)
+        self.master_status_ward     = QAction("病棟コード: 未読込", self)
+        self.master_status_comment  = QAction("コメント: 未読込", self)
+
+        # メニューからクリックされないように無効化
+        for act in [
+            self.master_status_disease,
+            self.master_status_modifier,
+            self.master_status_shinryo,
+            self.master_status_chouzai,
+            self.master_status_drug,
+            self.master_status_material,
+            self.master_status_ward,
+            self.master_status_comment,
+        ]:
+            act.setEnabled(False)
 
     def _create_menus(self) -> None:
         menubar = self.menuBar()
@@ -501,11 +542,58 @@ class MainWindow(QMainWindow):
         master_menu.addAction(self.load_material_master_action)
         master_menu.addAction(self.load_ward_master_action)
         master_menu.addAction(self.load_comment_master_action)
+        
+        # 読み込み状況表示（クリック不可のステータス行）
+        master_menu.addSeparator()
+        master_menu.addAction(self.master_status_disease)
+        master_menu.addAction(self.master_status_modifier)
+        master_menu.addAction(self.master_status_shinryo)
+        master_menu.addAction(self.master_status_chouzai)
+        master_menu.addAction(self.master_status_drug)
+        master_menu.addAction(self.master_status_material)
+        master_menu.addAction(self.master_status_ward)
+        master_menu.addAction(self.master_status_comment)        
 
     def _create_status_bar(self) -> None:
         status = QStatusBar(self)
         self.setStatusBar(status)
         self.statusBar().showMessage("UKE/CSVファイルを開いてください (Ctrl+O)")
+
+    def _update_master_status(self, key: str) -> None:
+        """
+        マスタ読込時に、メニュー上の「読み込み済み・日時」を更新する共通ヘルパー。
+        key は "disease" / "modifier" / "shinryo" / "chouzai" / "drug" /
+               "material" / "ward" / "comment" を想定。
+        """
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        label_map = {
+            "disease":  "傷病名",
+            "modifier": "修飾語",
+            "shinryo":  "診療行為",
+            "chouzai":  "調剤行為",
+            "drug":     "医薬品",
+            "material": "特定器材",
+            "ward":     "病棟コード",
+            "comment":  "コメント",
+        }
+        action_map = {
+            "disease":  self.master_status_disease,
+            "modifier": self.master_status_modifier,
+            "shinryo":  self.master_status_shinryo,
+            "chouzai":  self.master_status_chouzai,
+            "drug":     self.master_status_drug,
+            "material": self.master_status_material,
+            "ward":     self.master_status_ward,
+            "comment":  self.master_status_comment,
+        }
+
+        action = action_map.get(key)
+        if action is None:
+            return
+
+        label = label_map.get(key, key)
+        action.setText(f"{label}: 読込済み ({now_str})")
 
     # ─────────────────────────────
     # ファイル読み込み
@@ -686,8 +774,6 @@ class MainWindow(QMainWindow):
         inst_name = get(6)       # 6:医療機関名称
         claim_ym  = get(7)       # 7:請求年月(YYYYMM)
         vol       = get(8)       # 8:VOL
-
-
 
         payer_text = PAYER_TYPES.get(payer_code, payer_code or "-")
         pref_text  = PREF_NAMES.get(pref_code.zfill(2), pref_code or "-")
@@ -1009,6 +1095,7 @@ class MainWindow(QMainWindow):
         # 読み込んだ結果を自分のフィールドに反映
         self._disease_master = master
         save_master_paths("disease", path_objs)
+        self._update_master_status("disease")
 
         QMessageBox.information(
             self,
@@ -1045,6 +1132,7 @@ class MainWindow(QMainWindow):
         self._modifier_name_by_code = name_by_code
         self._modifier_kana_by_code = kana_by_code
         save_master_paths("modifier", path_objs)
+        self._update_master_status("modifier")
 
         QMessageBox.information(
             self,
@@ -1083,6 +1171,7 @@ class MainWindow(QMainWindow):
 
         self._shinryo_master = master
         save_master_paths("shinryo", path_objs)
+        self._update_master_status("shinryo")
 
         QMessageBox.information(
             self,
@@ -1121,6 +1210,7 @@ class MainWindow(QMainWindow):
 
         self._chouzai_master = master
         save_master_paths("chouzai", path_objs)
+        self._update_master_status("chouzai")
 
         QMessageBox.information(
             self,
@@ -1159,6 +1249,7 @@ class MainWindow(QMainWindow):
 
         self._drug_master = master
         save_master_paths("drug", path_objs)
+        self._update_master_status("drug")
 
         QMessageBox.information(
             self,
@@ -1197,6 +1288,7 @@ class MainWindow(QMainWindow):
 
         self._material_master = master
         save_master_paths("material", path_objs)
+        self._update_master_status("material")
 
         QMessageBox.information(
             self,
@@ -1235,6 +1327,7 @@ class MainWindow(QMainWindow):
 
         self._ward_master = master
         save_master_paths("ward", path_objs)
+        self._update_master_status("ward")
 
         QMessageBox.information(
             self,
@@ -1245,6 +1338,45 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(
             f"病棟コードマスタ読込完了: {len(self._ward_master):,} コード"
+        )
+        
+    def _on_load_comment_master(self) -> None:
+        """
+        [マスタ] → [コメントマスタ] の読込処理。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "コメントマスタファイルを選択（C マスタをまとめて選択可）",
+            "",
+            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            path_objs = [Path(p) for p in paths]
+            master = load_comment_master(path_objs)
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "コメントマスタ読み込みエラー",
+                f"コメントマスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
+            )
+            return
+
+        self._comment_master = master
+        save_master_paths("comment", path_objs)
+        self._update_master_status("comment")
+
+        QMessageBox.information(
+            self,
+            "コメントマスタ読込",
+            f"コメントマスタを読み込みました。\n"
+            f"ファイル数: {len(paths)}\n"
+            f"コメントコード数: {len(self._comment_master):,}",
+        )
+        self.statusBar().showMessage(
+            f"コメントマスタ読込完了: {len(self._comment_master):,} コード"
         )
 
     def _get_disease_name(self, code: str) -> str:
@@ -1309,6 +1441,20 @@ class MainWindow(QMainWindow):
             return ""
         return info.get("name") or info.get("text") or ""
 
+    def get_iyakuhin_name(self, code: str) -> str:
+        """
+        IYレコード向け: 医薬品コード → 医薬品名称。
+        実体は get_drug_name() をそのまま利用する。
+        """
+        return self.get_drug_name(code)
+
+    def get_tokutei_kizai_name(self, code: str) -> str:
+        """
+        TOレコード向け: 特定器材コード → 器材名称。
+        実体は get_material_name() をそのまま利用する。
+        """
+        return self.get_material_name(code)
+
     def get_comment_text(self, code: str) -> str:
         """コメントコード → コメント文字列（なければ空文字）。
         現状は将来のコメントマスタ読込に備えたフックとして利用します。
@@ -1319,6 +1465,42 @@ class MainWindow(QMainWindow):
         if not info:
             return ""
         return info.get("text") or info.get("name") or ""
+
+    def _is_abolished(self, info: dict[str, str] | None) -> bool:
+        """マスタ1件分の dict から『廃止コード』かどうかをゆるく判定するヘルパー。
+
+        - end_ymd が空、または 00000000 / 99999999 の場合は現役扱い
+        - それ以外であれば『廃止済み』として True を返す
+        （診療年月までは考慮しない『軽い利用』）
+        """
+        if not info:
+            return False
+
+        end_ymd = (info.get("end_ymd") or "").strip()
+        if not end_ymd:
+            return False
+
+        # 代表的なダミー値は『未廃止』扱い
+        if end_ymd in {"00000000", "99999999"}:
+            return False
+
+        # ここでは日付の詳細な妥当性チェックは行わず、
+        # 『何らかの終了年月日が入っている』ものを廃止扱いとする
+        return True
+
+    def is_disease_abolished(self, code: str) -> bool:
+        """傷病名コードがマスタ上『廃止』かどうかを簡易判定する。"""
+        if not code:
+            return False
+        info = self._disease_master.get(code.strip())
+        return self._is_abolished(info)
+
+    def is_shinryo_abolished(self, code: str) -> bool:
+        """診療行為コードがマスタ上『廃止』かどうかを簡易判定する。"""
+        if not code:
+            return False
+        info = self._shinryo_master.get(code.strip())
+        return self._is_abolished(info)
 
     # ─────────────────────────────
     # 検索ロジック
@@ -1689,41 +1871,3 @@ class MainWindow(QMainWindow):
             # それ以前は素直に西暦で返す
             return f"{year}.{month:02d}"
 
-
-    def _on_load_comment_master(self) -> None:
-        """
-        [マスタ] → [コメントマスタ] の読込処理。
-        """
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "コメントマスタファイルを選択（C マスタをまとめて選択可）",
-            "",
-            "テキストファイル (*.txt *.csv);;すべてのファイル (*.*)",
-        )
-        if not paths:
-            return
-
-        try:
-            path_objs = [Path(p) for p in paths]
-            master = load_comment_master(path_objs)
-        except Exception as e:
-            QMessageBox.warning(
-                self,
-                "コメントマスタ読み込みエラー",
-                f"コメントマスタファイルの読み込みに失敗しました。\n\nエラー: {e}",
-            )
-            return
-
-        self._comment_master = master
-        save_master_paths("comment", path_objs)
-
-        QMessageBox.information(
-            self,
-            "コメントマスタ読込",
-            f"コメントマスタを読み込みました。\n"
-            f"ファイル数: {len(paths)}\n"
-            f"コメントコード数: {len(self._comment_master):,}",
-        )
-        self.statusBar().showMessage(
-            f"コメントマスタ読込完了: {len(self._comment_master):,} コード"
-        )

@@ -13,6 +13,8 @@ _TABLE_FILES: Dict[str, str] = {
     "kakunin_kubun": "kakunin_kubun.json",
     "jushin_kubun": "jushin_kubun.json",
     "madoguchi_kbn": "madoguchi_kbn.json",
+    "shinryokamei": "shinryokamei_code.json",
+    "receipt_type": "receipt_type_code.json",  # ★ 追加
 }
 
 
@@ -67,3 +69,68 @@ def jushin_kubun_map() -> Dict[str, str]:
 
 def madoguchi_kbn_map() -> Dict[str, str]:
     return load_code_table("madoguchi_kbn")
+
+
+def shinryokamei_map() -> Dict[str, str]:
+    return load_code_table("shinryokamei")
+
+
+# ─────────────────────────────────────────────────────────
+# レセプト種別コード（別表5）
+# receipt_type_code.json は
+#   { "1112": {"description": "...", "nyuin_kbn": "入院外"}, ... }
+# のような dict を想定しているため、load_code_table は使わず
+# 生の JSON をそのまま返す専用ヘルパを用意する。
+# ─────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=None)
+def receipt_type_table() -> Dict[str, dict]:
+    """
+    レセプト種別コード → { description, nyuin_kbn, ... } の dict を返す。
+
+    例:
+        receipt_type_table()["1112"] ->
+            {"description": "医科・医保単独・本人/世帯主・入院外",
+             "nyuin_kbn": "入院外"}
+    """
+    filename = _TABLE_FILES["receipt_type"]
+    with resources.files("openreceview.data").joinpath(filename).open(
+        "r", encoding="utf-8"
+    ) as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Unsupported JSON format in {filename} (expected dict)")
+
+    # キーは文字列化して統一
+    result: Dict[str, dict] = {}
+    for k, v in raw.items():
+        result[str(k)] = v if isinstance(v, dict) else {"description": str(v)}
+    return result
+
+
+@lru_cache(maxsize=None)
+def receipt_type_inout_map() -> Dict[str, str]:
+    """
+    レセプト種別コード → 「入院」/「入院外」などの入院区分だけを取り出したマップ。
+    JSON 内の "nyuin_kbn" フィールドを参照する。
+    """
+    table = receipt_type_table()
+    result: Dict[str, str] = {}
+    for code, info in table.items():
+        if not isinstance(info, dict):
+            continue
+        ny = info.get("nyuin_kbn")
+        if ny:
+            result[str(code)] = str(ny)
+    return result
+
+
+def receipt_type_inout(code: str) -> str:
+    """
+    単一コードから「入院」/「入院外」等の入院区分を取得するユーティリティ。
+    対応するコードが無い場合は空文字列を返す。
+    """
+    if code is None:
+        return ""
+    return receipt_type_inout_map().get(str(code).strip(), "")

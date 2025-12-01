@@ -23,3 +23,4 @@ class ReceiptHeader:
     birthday: Optional[str] = None     # 生年月日 (YYYYMMDD)
 
     field_map: Optional[Dict[str, str]] = None
+    department_codes: list[str] | None = None  # 診療科名コード　["01","05",...] のように最大3件

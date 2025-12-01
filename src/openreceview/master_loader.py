@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import io
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Iterable
 import json
 import os
 
@@ -105,12 +105,57 @@ def _decode_text(raw: bytes) -> str:
     # 最後の保険: cp932 で壊れてもよいので無理やり読む
     return raw.decode("cp932", errors="ignore")
 
+
 def _detect_delimiter(text: str) -> str:
     """サンプル行から区切り文字を推定."""
     sample = "\n".join(text.splitlines()[:5])
     if "\t" in sample and ("," not in sample or sample.count("\t") >= sample.count(",")):
         return "\t"
     return ","
+
+
+# 行データから「適用開始年月日」「廃止年月日」らしき 8 桁数値を推定して取り出す
+def _extract_dates_from_row(row: list[str]) -> tuple[str, str]:
+    """
+    行データから「適用開始年月日」「廃止年月日」らしき 8 桁数値を推定して取り出す。
+
+    仕様上、多くのマスタでは末尾近くに
+        適用開始年月日, 廃止(終了)年月日
+    が配置されているため、
+    - 「YYYYMMDD」として妥当、もしくは
+    - 特殊値 00000000 / 99999999
+    を満たす 8 桁数値を抽出し、後ろから 2 つを
+    (start_ymd, end_ymd) として返す。
+
+    見つからない場合は ("", "") を返す。
+    """
+    def is_date_like(token: str) -> bool:
+        token = token.strip()
+        if len(token) != 8 or not token.isdigit():
+            return False
+        if token in ("00000000", "99999999"):
+            return True
+        year = int(token[:4])
+        month = int(token[4:6])
+        day = int(token[6:8])
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return False
+        return True
+
+    candidates: list[str] = []
+    for col in row:
+        col_stripped = col.strip()
+        if is_date_like(col_stripped):
+            candidates.append(col_stripped)
+
+    if len(candidates) >= 2:
+        # 末尾から 2 つを (開始, 終了) とみなす
+        return candidates[-2], candidates[-1]
+    elif len(candidates) == 1:
+        # 1 つだけの場合は終了日だけ分かるケースとして扱う
+        return "", candidates[0]
+    else:
+        return "", ""
 
 def load_disease_master(paths: list[Path]) -> Dict[str, Dict[str, str]]:
     """
@@ -152,7 +197,13 @@ def load_disease_master(paths: list[Path]) -> Dict[str, Dict[str, str]]:
             if not name and not kana:
                 continue
 
-            master[code] = {"name": name, "kana": kana}
+            start_ymd, end_ymd = _extract_dates_from_row(row)
+            info: Dict[str, str] = {"name": name, "kana": kana}
+            if start_ymd:
+                info["start_ymd"] = start_ymd
+            if end_ymd:
+                info["end_ymd"] = end_ymd
+            master[code] = info
 
     _save_simple_master_to_disk("disease", paths, master)
     _MASTER_CACHE[key] = master
@@ -386,7 +437,13 @@ def load_simple_master(
             if not name and not kana:
                 continue
 
-            master[code] = {"name": name, "kana": kana}
+            start_ymd, end_ymd = _extract_dates_from_row(row)
+            info: Dict[str, str] = {"name": name, "kana": kana}
+            if start_ymd:
+                info["start_ymd"] = start_ymd
+            if end_ymd:
+                info["end_ymd"] = end_ymd
+            master[code] = info
 
     return master
 

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTabWidget,
     QLineEdit,
+    QSizePolicy,
 )
 from PySide6.QtGui import QFont
 from typing import Optional
@@ -32,7 +33,79 @@ from openreceview.code_tables import (
     kakunin_kubun_map,
     jushin_kubun_map,
     madoguchi_kbn_map,
+    shinryokamei_map,
+    receipt_type_table,
 )
+
+# 共通「種別」表示文字列生成ヘルパ
+def build_receipt_type_summary(receipt: UkeReceipt) -> str:
+    """
+    レセ電ビューワーのヘッダに表示される「種別」相当の文字列を簡易的に組み立てる共通ヘルパ。
+
+    優先順位:
+      1) REヘッダにあるレセプト種別コード (receipt_type) を、別表5マスタ(receipt_type_table)
+         から名称展開して使う。
+      2) 1)でマスタが見つからない場合は、
+         「医科」＋ 負担者種別(SN) ＋ 窓口負担額の区分(MF) ＋ 「入院外」
+         の簡易組み立てにフォールバックする。
+    """
+    if receipt is None or getattr(receipt, "header", None) is None:
+        return "-"
+
+    parts: list[str] = []
+    header = receipt.header
+
+    # 1) レセプト種別コード → 別表5マスタから名称展開
+    try:
+        r_type_code = (getattr(header, "receipt_type", None) or "").strip()
+    except Exception:
+        r_type_code = ""
+
+    if r_type_code:
+        desc = ""
+        try:
+            table = receipt_type_table()
+            info = table.get(r_type_code)
+            if isinstance(info, dict):
+                desc = str(info.get("description", "")).strip()
+            elif info is not None:
+                desc = str(info).strip()
+        except Exception:
+            desc = ""
+
+        if desc:
+            parts.append(desc)
+
+    # 2) マスタから名称が取れなかった場合は、従来どおり SN / MF から簡易組み立て
+    if not parts:
+        parts.append("医科")
+
+        # SN: 負担者種別コード → 名称
+        sn_record = next((r for r in getattr(receipt, "records", []) if r.record_type == "SN"), None)
+        if sn_record is not None and getattr(sn_record, "fields", None):
+            f = sn_record.fields
+            if len(f) > 1 and f[1]:
+                code = f[1].strip()
+                if code:
+                    label = futansha_type_map().get(code, code)
+                    if label:
+                        parts.append(label)
+
+        # MF: 窓口負担額の区分 → 名称
+        mf_record = next((r for r in getattr(receipt, "records", []) if r.record_type == "MF"), None)
+        if mf_record is not None and getattr(mf_record, "fields", None):
+            f = mf_record.fields
+            if len(f) > 1 and f[1]:
+                code = f[1].strip()
+                if code:
+                    label = madoguchi_kbn_map().get(code, code)
+                    if label:
+                        parts.append(label)
+
+        # 入院 / 入院外（当面は入院外固定）
+        parts.append("入院外")
+
+    return "  ".join(parts) if parts else "-"
 
 class ReceiptSummaryWidget(QWidget):
     """
@@ -52,6 +125,10 @@ class ReceiptSummaryWidget(QWidget):
         get_modifier_kana: Optional[Callable[[str], str]] = None,
         get_shinryo_name: Optional[Callable[[str], str]] = None,
         get_comment_text: Optional[Callable[[str], str]] = None,
+        get_iyakuhin_name: Optional[Callable[[str], str]] = None,
+        get_tokutei_kizai_name: Optional[Callable[[str], str]] = None,
+        is_disease_abolished: Optional[Callable[[str], bool]] = None,
+        is_shinryo_abolished: Optional[Callable[[str], bool]] = None,
     ) -> None:
         super().__init__(parent)
 
@@ -61,6 +138,11 @@ class ReceiptSummaryWidget(QWidget):
         self._get_modifier_kana = get_modifier_kana
         self._get_shinryo_name = get_shinryo_name
         self._get_comment_text = get_comment_text
+        self._get_iyakuhin_name = get_iyakuhin_name
+        self._get_tokutei_kizai_name = get_tokutei_kizai_name
+
+        self._is_disease_abolished = is_disease_abolished
+        self._is_shinryo_abolished = is_shinryo_abolished
 
         # カレントレセプト
         self._current_receipt: Optional[UkeReceipt] = None
@@ -100,33 +182,49 @@ class ReceiptSummaryWidget(QWidget):
         header_layout.setHorizontalSpacing(12)
         header_layout.setVerticalSpacing(4)
 
-        def add_header_item(index: int, title: str) -> QLabel:
+        def add_header_item(index: int, title: str, use_lineedit: bool = False) -> QLabel:
             row = index // 3
             col = index % 3
             base_col = col * 2
 
             lbl_title = QLabel(title, header_group)
-            lbl_value = QLabel("", header_group)
+
+            if use_lineedit:
+                # 長いテキスト向け: 水平スクロール可能な QLineEdit を使用
+                value_widget = QLineEdit(header_group)
+                value_widget.setReadOnly(True)
+                value_widget.setFrame(False)
+                value_widget.setStyleSheet("background: transparent;")
+                value_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            else:
+                value_widget = QLabel("", header_group)
+                value_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
             header_layout.addWidget(lbl_title, row, base_col)
-            header_layout.addWidget(lbl_value, row, base_col + 1)
-            return lbl_value
+            header_layout.addWidget(value_widget, row, base_col + 1)
+            return value_widget
 
         self.lbl_year_month    = add_header_item(0, "診療年月")
-        self.lbl_receipt_type  = add_header_item(1, "レセプト種別")
-        self.lbl_patient_id    = add_header_item(2, "患者番号")
-        self.lbl_name          = add_header_item(3, "名前")
-        self.lbl_name_kana     = add_header_item(4, "カナ氏名")
-        self.lbl_sex           = add_header_item(5, "性別")
-        self.lbl_birthday      = add_header_item(6, "生年月日")
-        self.lbl_age           = add_header_item(7, "年齢")
-        self.lbl_insurer       = add_header_item(8, "保険者番号")
-        self.lbl_days          = add_header_item(9,  "診療実日数")
-        self.lbl_total_points  = add_header_item(10, "合計点数【イ】")
-        
+        self.lbl_type          = add_header_item(1, "種別", use_lineedit=True)
+        self.lbl_receipt_no    = add_header_item(2, "レセプト番号")
+
+        self.lbl_patient_id    = add_header_item(3, "患者番号")
+        self.lbl_name          = add_header_item(4, "名前")
+        self.lbl_name_kana     = add_header_item(5, "カナ氏名")
+
+        self.lbl_sex           = add_header_item(6, "性別")
+        self.lbl_birthday      = add_header_item(7, "生年月日")
+        self.lbl_age           = add_header_item(8, "年齢")
+
+        self.lbl_insurer       = add_header_item(9,  "保険者番号")
+        self.lbl_days          = add_header_item(10, "診療実日数")
+        self.lbl_total_points  = add_header_item(11, "合計点数")
+
         # ★ 点数チェック用
-        self.lbl_calc_points   = add_header_item(11, "再計算点数（SI）")
-        self.lbl_points_diff   = add_header_item(12, "差分（再計算 − 合計）")        
+        self.lbl_calc_points   = add_header_item(12, "再計算点数（SI）")
+        self.lbl_points_diff   = add_header_item(13, "差分（再計算 − 合計）")
+
+        self.lbl_department    = add_header_item(14, "診療科")
 
         # ── 中段: 傷病名一覧 + 表記設定 ─────────────────
         disease_frame = QFrame(splitter)
@@ -179,20 +277,12 @@ class ReceiptSummaryWidget(QWidget):
 
         disease_layout.addWidget(self.disease_table)
 
-        # ── 下段: 生レコード表示 ─────────────────────
-        self.raw_view = QPlainTextEdit(splitter)
-        self.raw_view.setReadOnly(True)
-        self.raw_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.raw_view.setPlaceholderText("このレセプトに含まれるレコードが表示されます")
-
         # splitter にウィジェットを追加
         splitter.addWidget(header_group)
         splitter.addWidget(disease_frame)
-        splitter.addWidget(self.raw_view)
 
         splitter.setStretchFactor(0, 0)  # ヘッダはあまり伸ばさない
         splitter.setStretchFactor(1, 3)  # 傷病名テーブル
-        splitter.setStretchFactor(2, 1)  # 生レコード
 
         patient_layout.addWidget(splitter)
         self.tab_widget.addTab(patient_page, "患者情報")
@@ -206,6 +296,9 @@ class ReceiptSummaryWidget(QWidget):
             self,
             get_shinryo_name=self._get_shinryo_name,
             get_comment_text=self._get_comment_text,
+            get_iyakuhin_name=self._get_iyakuhin_name,
+            get_tokutei_kizai_name=self._get_tokutei_kizai_name,
+            is_shinryo_abolished=self._is_shinryo_abolished,
         )
         self.tab_widget.addTab(self.santeibi_widget, "算定日")
 
@@ -225,12 +318,27 @@ class ReceiptSummaryWidget(QWidget):
         # レセプトプレビュータブ: 実装済みウィジェット
         self.preview_widget = ReceiptPreviewWidget(
             self,
+            get_disease_name=self._get_disease_name,
+            get_disease_kana=self._get_disease_kana,
             get_shinryo_name=self._get_shinryo_name,
             get_comment_text=self._get_comment_text,
+            is_disease_abolished=self._is_disease_abolished,
+            is_shinryo_abolished=self._is_shinryo_abolished,
         )
         self.tab_widget.addTab(self.preview_widget, "レセプトプレビュー")
-        # プレースホルダ（レセ電コード[個別]）は従来通り
-        add_simple_tab("レセ電コード[個別]", "【レセ電コード[個別]】タブ（今後実装予定）")
+        # レセ電コード[個別]タブ: 生レコード一覧を表示
+        raw_page = QWidget(self)
+        raw_layout = QVBoxLayout(raw_page)
+        raw_layout.setContentsMargins(4, 4, 4, 4)
+        raw_layout.setSpacing(4)
+
+        self.raw_view = QPlainTextEdit(raw_page)
+        self.raw_view.setReadOnly(True)
+        self.raw_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.raw_view.setPlaceholderText("このレセプトに含まれるレコードが表示されます")
+
+        raw_layout.addWidget(self.raw_view)
+        self.tab_widget.addTab(raw_page, "レセ電コード[個別]")
 
     # ─────────────────────────────
     # 公開API: レセプトをセット
@@ -244,8 +352,31 @@ class ReceiptSummaryWidget(QWidget):
 
         h = receipt.header
 
+        # 診療年月
         self.lbl_year_month.setText(h.year_month or "-")
-        self.lbl_receipt_type.setText(h.receipt_type or "-")
+
+        # 種別（レセプト種別コード＋SN/MF からの簡易ラベル）
+        type_text = build_receipt_type_summary(receipt)
+        self.lbl_type.setText(type_text or "-")
+        # 種別の QLineEdit が末尾側にスクロールした状態で表示されないよう、先頭にカーソルを戻す
+        try:
+            if isinstance(self.lbl_type, QLineEdit):
+                self.lbl_type.setCursorPosition(0)
+        except Exception:
+            # 型の違いなどで失敗しても UI が落ちないようにガード
+            pass
+
+        # レセプト番号
+        # 1) ヘッダが receipt_number / receipt_no を持っていればそれを優先
+        # 2) 無い場合は UkeReceipt.index（1始まりのレセプト通し番号）を表示
+        receipt_no = (
+            getattr(h, "receipt_number", None)
+            or getattr(h, "receipt_no", None)
+            or (str(receipt.index) if getattr(receipt, "index", None) is not None else None)
+        )
+        self.lbl_receipt_no.setText(receipt_no or "-")
+
+        # 患者基本情報
         self.lbl_patient_id.setText(h.patient_id or "-")
         self.lbl_name.setText(h.name or "-")
         self.lbl_name_kana.setText(h.name_kana or "-")
@@ -278,6 +409,10 @@ class ReceiptSummaryWidget(QWidget):
         self.lbl_days.setText(days)
         self.lbl_total_points.setText(total_points)
         
+        # 診療科名コード（REヘッダ由来）
+        dept_text = self._format_department_display(getattr(h, "department_codes", None))
+        self.lbl_department.setText(dept_text)
+        
         # 点数チェック（HO 合計点数 vs SI 再計算）
         if self._current_receipt is not None:
             self._update_points_check(self._current_receipt, total_points)        
@@ -302,6 +437,39 @@ class ReceiptSummaryWidget(QWidget):
         # 傷病名一覧
         self._populate_diseases(receipt)
 
+    # ─────────────────────────────
+    # 診療科名整形ヘルパ
+    # ─────────────────────────────
+    def _format_department_display(self, codes: Optional[list[str] | tuple[str, ...]]) -> str:
+        """
+        ReceiptHeader.department_codes から表示用の診療科名文字列を作成する。
+
+        - codes は ["01", "05", ...] のようなコード配列を想定
+        - マスタ(shinryokamei_map) があれば名称に展開し、「内科 / 消化器科」のように連結する
+        - コードがマスタにない場合はコードそのものを表示する
+        """
+        if not codes:
+            return "-"  # 診療科情報なし
+
+        try:
+            mapping = shinryokamei_map()
+        except Exception:
+            mapping = {}
+
+        labels: list[str] = []
+        for code in codes:
+            c = (code or "").strip()
+            if not c:
+                continue
+            name = mapping.get(c)
+            if name:
+                labels.append(name)
+            else:
+                # 不明なコードはそのまま表示
+                labels.append(c)
+
+        return " / ".join(labels) if labels else "-"
+    
     # ─────────────────────────────
     # 点数再計算（SI → 合計点）
     # ─────────────────────────────
@@ -411,7 +579,8 @@ class ReceiptSummaryWidget(QWidget):
             main_flag     = get(6).strip()
 
             # 主病名マーク（〇／空）
-            main_mark = "〇" if main_flag and main_flag != "0" else ""
+            # 仕様上、主傷病コード「01」の場合のみ主病名とみなす
+            main_mark = "〇" if main_flag == "01" else ""
 
             # 修飾語コードを4桁ごとに分割
             modifier_codes = self._split_modifier_codes(modifier_raw)
@@ -461,6 +630,27 @@ class ReceiptSummaryWidget(QWidget):
         """
         code = (code or "").strip()
 
+        # --- 未コード化傷病名 (0000999) の特別扱い -----------------
+        # 仕様上、コード 0000999 のときは「未コード化傷病名」として扱い、
+        # 修飾語は付けずに SY の名称（fallback_name）を優先して表示する。
+        if code == "0000999":
+            base_name = fallback_name or ""
+            if not base_name and self._get_disease_name is not None:
+                base_name = self._get_disease_name(code) or ""
+            if not base_name:
+                base_name = "未コード化傷病名"
+
+            full_name = f"[未コード化]{base_name}"
+
+            # カナ表示(オプション)
+            if self.show_disease_kana and self._get_disease_kana is not None:
+                kana = self._get_disease_kana(code)
+                if kana:
+                    full_name = f"{full_name}（{kana}）"
+
+            return full_name
+
+        # --- 通常の傷病名（コード化済み） -------------------------
         # ベースの傷病名（マスタ優先）
         base_name = ""
         if code and self._get_disease_name is not None:
@@ -472,6 +662,10 @@ class ReceiptSummaryWidget(QWidget):
         prefixes: list[str] = []
         suffixes: list[str] = []
 
+        # 修飾語コードは 4 桁固定で、
+        #   0001〜7999: 接頭語
+        #   8000〜8999: 接尾語
+        # として扱う（9000〜 は歯式用だが、医科では通常出現しないため前置き扱いにフォールバック）。
         if self._get_modifier_name is not None:
             for m_code in modifier_codes:
                 m_code = m_code.strip()
@@ -482,19 +676,20 @@ class ReceiptSummaryWidget(QWidget):
                 if not text:
                     continue
 
-                # 簡易ルール:
-                # 1000〜7999 → 前に付ける（接頭語）
-                # 8000〜     → 後ろに付ける（接尾語）
                 try:
                     n = int(m_code)
                 except ValueError:
+                    # 数値化できない場合はとりあえず前に付ける
                     prefixes.append(text)
                     continue
 
-                if 1000 <= n < 8000:
+                if 1 <= n <= 7999:
                     prefixes.append(text)
-                else:
+                elif 8000 <= n <= 8999:
                     suffixes.append(text)
+                else:
+                    # 想定外レンジは前置き扱いにしておく
+                    prefixes.append(text)
 
         full_name = "".join(prefixes) + base_name + "".join(suffixes)
 
@@ -503,6 +698,15 @@ class ReceiptSummaryWidget(QWidget):
             kana = self._get_disease_kana(code)
             if kana:
                 full_name = f"{full_name}（{kana}）"
+
+        # 廃止傷病名の簡易マーク付け
+        if self._is_disease_abolished is not None and code:
+            try:
+                if self._is_disease_abolished(code):
+                    full_name = f"{full_name}（廃止）"
+            except Exception:
+                # 呼び出し側の実装ミス等で UI が落ちないようにガード
+                pass
 
         return full_name
     
@@ -552,7 +756,8 @@ class ReceiptSummaryWidget(QWidget):
     def _clear(self) -> None:
         for lbl in [
             self.lbl_year_month,
-            self.lbl_receipt_type,
+            self.lbl_type,
+            self.lbl_receipt_no,
             self.lbl_patient_id,
             self.lbl_name,
             self.lbl_name_kana,
@@ -564,6 +769,7 @@ class ReceiptSummaryWidget(QWidget):
             self.lbl_total_points,
             self.lbl_calc_points,
             self.lbl_points_diff,
+            self.lbl_department,
         ]:
             lbl.setText("-")
 
@@ -813,8 +1019,9 @@ class QualificationWidget(QWidget):
                 return f[i] if len(f) > i and f[i] else ""
 
             madoguchi = get_mf(1).strip()  # (2) 窓口負担額の区分
-            # 別表31 対応（現状はコード表示だけ）
-            self.lbl_madoguchi_kbn.setText(madoguchi)
+            # 別表31 対応: コード → 名称に変換（マスタに無い場合はコードのまま）
+            label = madoguchi_kbn_map().get(madoguchi, madoguchi)
+            self.lbl_madoguchi_kbn.setText(label)
         # --- JD (受診日等レコード) -----------------------------------
         jd_record = next(
             (r for r in receipt.records if r.record_type == "JD"),
@@ -850,6 +1057,13 @@ class QualificationWidget(QWidget):
                 self.lbl_jd_futansha.setText("区分")
 
 class SanteibiWidget(QWidget):
+    def _build_type_summary(self, receipt: UkeReceipt) -> str:
+        """
+        レセ電ビューワーのヘッダに表示される「種別」相当の文字列を組み立てる。
+
+        実際のロジックはモジュール共通ヘルパ `build_receipt_type_summary` に委譲する。
+        """
+        return build_receipt_type_summary(receipt)
     """
     算定日タブ（ヘッダ + SI / IY / TO / CO レコード一覧）
     """
@@ -858,10 +1072,16 @@ class SanteibiWidget(QWidget):
         parent: Optional[QWidget] = None,
         get_shinryo_name: Optional[Callable[[str], str]] = None,
         get_comment_text: Optional[Callable[[str], str]] = None,
+        get_iyakuhin_name: Optional[Callable[[str], str]] = None,
+        get_tokutei_kizai_name: Optional[Callable[[str], str]] = None,
+        is_shinryo_abolished: Optional[Callable[[str], bool]] = None,
     ) -> None:
         super().__init__(parent)
         self._get_shinryo_name = get_shinryo_name
         self._get_comment_text = get_comment_text
+        self._get_iyakuhin_name = get_iyakuhin_name
+        self._get_tokutei_kizai_name = get_tokutei_kizai_name
+        self._is_shinryo_abolished = is_shinryo_abolished
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -875,20 +1095,31 @@ class SanteibiWidget(QWidget):
         header_layout.setHorizontalSpacing(12)
         header_layout.setVerticalSpacing(2)
 
-        def add_header_item(row: int, col: int, title: str) -> QLabel:
+        def add_header_item(row: int, col: int, title: str, use_lineedit: bool = False) -> QLabel:
             base_col = col * 2
             lbl_title = QLabel(title, header_group)
-            lbl_value = QLabel("-", header_group)
+
+            if use_lineedit:
+                value_widget = QLineEdit(header_group)
+                value_widget.setReadOnly(True)
+                value_widget.setFrame(False)
+                value_widget.setStyleSheet("background: transparent;")
+                value_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                value_widget.setText("-")
+            else:
+                value_widget = QLabel("-", header_group)
+                value_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
             header_layout.addWidget(lbl_title, row, base_col)
-            header_layout.addWidget(lbl_value, row, base_col + 1)
-            return lbl_value
+            header_layout.addWidget(value_widget, row, base_col + 1)
+            return value_widget
 
         # 1行目
         self.lbl_san_patient_id   = add_header_item(0, 0, "患者番号")
         self.lbl_san_receipt_no   = add_header_item(0, 1, "レセプト番号")
         self.lbl_san_sex          = add_header_item(0, 2, "性別")
         # 2行目
-        self.lbl_san_type         = add_header_item(1, 0, "種別")
+        self.lbl_san_type         = add_header_item(1, 0, "種別", use_lineedit=True)
         self.lbl_san_year_month   = add_header_item(1, 1, "診療年月")
         # 3行目
         self.lbl_san_name         = add_header_item(2, 0, "氏名")
@@ -949,12 +1180,25 @@ class SanteibiWidget(QWidget):
         self.lbl_san_name.setText(h.name or "-")
         self.lbl_san_birthday.setText(h.birthday or "-")
 
-        # レセプト番号・種別はモデル側の属性名に合わせて適宜変更
-        receipt_no = getattr(h, "receipt_number", None) or getattr(h, "receipt_no", None)
+        # レセプト番号
+        # 1) ヘッダの receipt_number / receipt_no を優先
+        # 2) 無ければ UkeReceipt.index を使う
+        receipt_no = (
+            getattr(h, "receipt_number", None)
+            or getattr(h, "receipt_no", None)
+            or (str(receipt.index) if getattr(receipt, "index", None) is not None else None)
+        )
         self.lbl_san_receipt_no.setText(receipt_no or "-")
 
-        rec_type = getattr(h, "receipt_type", None)
-        self.lbl_san_type.setText(rec_type or "-")
+        # 種別: レセ電ビューワー相当の表示を簡易的に組み立て
+        type_text = self._build_type_summary(receipt)
+        self.lbl_san_type.setText(type_text or "-")
+        # 種別の QLineEdit が末尾側にスクロールした状態で表示されないよう、先頭にカーソルを戻す
+        try:
+            if isinstance(self.lbl_san_type, QLineEdit):
+                self.lbl_san_type.setCursorPosition(0)
+        except Exception:
+            pass
 
         # ── SI / IY / TO / CO レコード一覧 ──
         row_idx = 0
@@ -992,16 +1236,31 @@ class SanteibiWidget(QWidget):
                 if self._get_shinryo_name is not None and code:
                     name = self._get_shinryo_name(code) or ""
                     if name:
-                        # 例: "111000110 初診料"
+                        code_disp = f"{code} {name}"
+                        # 廃止コードであれば簡易マーク
+                        if self._is_shinryo_abolished is not None:
+                            try:
+                                if self._is_shinryo_abolished(code):
+                                    code_disp = f"{code_disp}（廃止）"
+                            except Exception:
+                                pass
+                    else:
+                        code_disp = code
+            elif rec_type == "IY":
+                # 医薬品マスタで名称に変換
+                if self._get_iyakuhin_name is not None and code:
+                    name = self._get_iyakuhin_name(code) or ""
+                    if name:
+                        code_disp = f"{code} {name}"
+            elif rec_type == "TO":
+                # 特定器材マスタで名称に変換
+                if self._get_tokutei_kizai_name is not None and code:
+                    name = self._get_tokutei_kizai_name(code) or ""
+                    if name:
                         code_disp = f"{code} {name}"
             elif rec_type == "CO":
-                # コメントマスタでコメント名称に変換
-                if self._get_comment_text is not None and code:
-                    text = self._get_comment_text(code) or ""
-                    if text:
-                        code_disp = f"{code} {text}"
-            # IY / TO は今のところコードのみ表示だが、
-            # 将来 get_iyakuhin_name / get_tokutei_kizai_name を追加すればここで展開可能。
+                # コメントマスタ + CO レコード内容から表示用文字列を整形
+                code_disp = self._build_co_display(code, f)
 
             self.table.insertRow(row_idx)
 
@@ -1021,6 +1280,40 @@ class SanteibiWidget(QWidget):
 
             row_idx += 1
 
+    def _build_co_display(self, code: str, fields: list[str]) -> str:
+        """
+        COレコードの表示整形。
+
+        - コメントマスタから名称を取得
+        - 代表的なコメントパターン(20/30/31など)では、後続フィールドに
+          付加情報が入るため、現時点では 7列目以降の非空フィールドを
+          まとめて括弧付きで表示する簡易実装とする。
+
+        ※ 厳密なフォーマットは今後 master_loader 側でパターン別に
+           調整していく前提の暫定実装です。
+        """
+        base_code = code.strip()
+        # ベース名称
+        label = ""
+        if self._get_comment_text is not None and base_code:
+            label = self._get_comment_text(base_code) or ""
+
+        if not label:
+            # マスタに名称が無い場合はコードのみ返す
+            return base_code
+
+        # 7列目以降の非空フィールドを付加情報としてまとめる
+        extras: list[str] = []
+        for v in fields[7:]:
+            v = (v or "").strip()
+            if v:
+                extras.append(v)
+
+        if extras:
+            return f"{base_code} {label} ({', '.join(extras)})"
+        else:
+            return f"{base_code} {label}"
+
 
 # ─────────────────────────────
 # レセプト簡易プレビューウィジェット
@@ -1032,12 +1325,20 @@ class ReceiptPreviewWidget(QWidget):
     def __init__(
         self,
         parent: Optional[QWidget] = None,
+        get_disease_name: Optional[Callable[[str], str]] = None,
+        get_disease_kana: Optional[Callable[[str], str]] = None,
         get_shinryo_name: Optional[Callable[[str], str]] = None,
         get_comment_text: Optional[Callable[[str], str]] = None,
+        is_disease_abolished: Optional[Callable[[str], bool]] = None,
+        is_shinryo_abolished: Optional[Callable[[str], bool]] = None,
     ) -> None:
         super().__init__(parent)
+        self._get_disease_name = get_disease_name
+        self._get_disease_kana = get_disease_kana
         self._get_shinryo_name = get_shinryo_name
         self._get_comment_text = get_comment_text
+        self._is_disease_abolished = is_disease_abolished
+        self._is_shinryo_abolished = is_shinryo_abolished
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1074,17 +1375,46 @@ class ReceiptPreviewWidget(QWidget):
             if getattr(rec, "record_type", "") != "SY":
                 continue
             f = rec.fields
+
             def get(i: int) -> str:
                 return f[i] if len(f) > i and f[i] is not None else ""
+
             code = get(1).strip()
             start_raw = get(2).strip()
             tenki_raw = get(3).strip()
             modifier_raw = get(4).strip()
             name_in_sy = get(5).strip()
             main_flag = get(6).strip()
-            mark = "★" if main_flag and main_flag != "0" else "・"
-            # For preview, just use name_in_sy if present, otherwise code
-            label = name_in_sy if name_in_sy else code
+
+            # 主傷病コード「01」の場合のみ★印を付ける
+            mark = "★" if main_flag == "01" else "・"
+
+            # マスタ優先で名称を取得し、コードは原則表示しない
+            # ただしコード 0000999 は「未コード化傷病名」として特別扱いする。
+            if code == "0000999":
+                base_label = name_in_sy or ""
+                if not base_label and self._get_disease_name is not None:
+                    base_label = self._get_disease_name(code) or ""
+                if not base_label:
+                    base_label = "未コード化傷病名"
+                label = f"[未コード化]{base_label}"
+            else:
+                label = ""
+                if code and self._get_disease_name is not None:
+                    label = self._get_disease_name(code) or ""
+
+                if not label:
+                    # マスタに無い場合は SY の名称、それもなければコードをフォールバックとして使用
+                    label = name_in_sy or code
+
+            # 廃止傷病名の簡易マーク
+            if code and code != "0000999" and self._is_disease_abolished is not None:
+                try:
+                    if self._is_disease_abolished(code):
+                        label = f"{label}（廃止）"
+                except Exception:
+                    pass
+
             lines.append(f"{mark} {label}")
         lines.append("")
         # 診療行為
@@ -1093,19 +1423,36 @@ class ReceiptPreviewWidget(QWidget):
             if getattr(rec, "record_type", "") != "SI":
                 continue
             f = rec.fields
+
             def get(i: int) -> str:
                 return f[i] if len(f) > i and f[i] is not None else ""
+
             shikibetsu = get(1).strip()
             futan = get(2).strip()
             shinryo_code = get(3).strip()
             suuryo = get(4).strip()
             tensu = get(5).strip()
             kaisuu = get(6).strip()
-            shinryo_disp = shinryo_code
-            if self._get_shinryo_name is not None and shinryo_code:
+
+            # 診療行為コードはできるだけ名称に変換し、コードは表示しない
+            shinryo_disp = ""
+            if shinryo_code and self._get_shinryo_name is not None:
                 name = self._get_shinryo_name(shinryo_code) or ""
                 if name:
-                    shinryo_disp = f"{shinryo_code} {name}"
+                    shinryo_disp = name
+
+            if not shinryo_disp:
+                # マスタに無い場合のみコードを出す
+                shinryo_disp = shinryo_code
+
+            # 廃止診療行為の簡易マーク
+            if shinryo_code and self._is_shinryo_abolished is not None:
+                try:
+                    if self._is_shinryo_abolished(shinryo_code):
+                        shinryo_disp = f"{shinryo_disp}（廃止）"
+                except Exception:
+                    pass
+
             # 算定日
             days = []
             for day in range(1, 32):
@@ -1113,6 +1460,8 @@ class ReceiptPreviewWidget(QWidget):
                 if len(f) > idx and f[idx]:
                     days.append(str(day))
             days_str = ",".join(days) if days else "-"
-            lines.append(f"{shikibetsu}/{futan}  {shinryo_disp}  点数:{tensu}  回数:{kaisuu}  算定日:{days_str}")
+            lines.append(
+                f"{shikibetsu}/{futan}  {shinryo_disp}  点数:{tensu}  回数:{kaisuu}  算定日:{days_str}"
+            )
         text = "\n".join(lines)
         self.text_edit.setPlainText(text)
